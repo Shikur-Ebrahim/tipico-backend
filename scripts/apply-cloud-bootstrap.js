@@ -55,6 +55,28 @@ CREATE TABLE IF NOT EXISTS deposit_requests (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS withdrawal_methods (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100),
+  type VARCHAR(50),
+  logo_url TEXT,
+  active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS withdrawal_requests (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  method_id INT,
+  amount NUMERIC(12,2) NOT NULL,
+  account_name VARCHAR(200),
+  account_details TEXT,
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_bet_slips_ticket_code ON bet_slips(ticket_code) WHERE ticket_code IS NOT NULL;
 `;
 

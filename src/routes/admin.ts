@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import pool from '../config/database';
 import jwt from 'jsonwebtoken';
-import { ensureWithdrawalSchema } from '../db/ensureWithdrawalRequests';
+import { ensureWithdrawalMethodsTable, ensureWithdrawalSchema } from '../db/ensureWithdrawalRequests';
 import { ensureManualPresetSchema } from '../db/ensureManualPresetSchema';
 import { allocateUniqueTicketCode } from '../utils/ticketCode';
 
@@ -104,6 +104,8 @@ router.post('/withdrawal-methods', verifyAdmin, async (req: Request, res: Respon
   const { name, type, logoUrl } = req.body;
 
   try {
+    await ensureWithdrawalMethodsTable();
+
     // Check for duplicates
     const checkResult = await pool.query(
       'SELECT id FROM withdrawal_methods WHERE name = $1 AND active = true',
@@ -131,18 +133,7 @@ router.post('/withdrawal-methods', verifyAdmin, async (req: Request, res: Respon
 // Get all withdrawal methods
 router.get('/withdrawal-methods', async (_req: Request, res: Response) => {
   try {
-    // Ensure table exists
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS withdrawal_methods (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(100),
-        type VARCHAR(50),
-        logo_url TEXT,
-        active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
+    await ensureWithdrawalMethodsTable();
 
     const result = await pool.query('SELECT * FROM withdrawal_methods WHERE active = true ORDER BY name ASC');
     res.json(result.rows);
@@ -157,6 +148,7 @@ router.delete('/withdrawal-methods/:id', verifyAdmin, async (req: Request, res: 
   const { id } = req.params;
 
   try {
+    await ensureWithdrawalMethodsTable();
     await pool.query('UPDATE withdrawal_methods SET active = false, updated_at = NOW() WHERE id = $1', [id]);
     res.json({ message: 'Method deleted successfully' });
   } catch (err) {
