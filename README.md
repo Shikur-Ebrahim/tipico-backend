@@ -77,19 +77,21 @@ The script hashes the password with bcrypt and either updates an existing user�
 
 ## Copy football data local → Render (fast)
 
-API sync is slow for hundreds of matches. To **bulk-copy** fixtures + odds (and related rows) from your **local** DB into **Render**:
+API sync is slow for hundreds of matches. To **bulk-copy** fixtures + odds (and related rows) from your **local** DB into **Render** so production matches what works on your PC:
 
-1. Point `DATABASE_URL` in `backend/.env` at the **Render external** URL (from your PC).
-2. Set **`SOURCE_DATABASE_URL`** to your **local** Postgres URL (same DB that already has ~500 games).
-3. Ensure Render has **no** `bet_selections` tied to real `fixture_id`, or set `MIGRATE_FOOTBALL_ALLOW_BET_ORPHAN=1` (NULLs those `fixture_id` — only if you accept that).
-4. Run:
+1. In the [Render dashboard](https://dashboard.render.com), open your Postgres → copy the **External Database URL** (your laptop cannot use the internal hostname).
+2. From **PowerShell**, set **`SOURCE_DATABASE_URL`** to your local DB (the one that already has matches), **`DATABASE_URL`** to the Render **external** URL, then run the migration (env vars you set here override `backend/.env` for this command only):
 
    ```powershell
+   cd d:\projects\tipico\backend   # or your clone path
+   $env:SOURCE_DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/YOUR_LOCAL_DB"
+   $env:DATABASE_URL="postgresql://USER:PASSWORD@HOST.region-postgres.render.com/YOUR_DB?sslmode=require"
    $env:MIGRATE_FOOTBALL_CONFIRM="yes"
    npm run migrate:football
    ```
 
-5. Put `DATABASE_URL` back to whatever you use for day-to-day after the copy.
+3. If the script refuses because of **`bet_selections`** tied to fixtures, either clear test bets on Render first or set **`MIGRATE_FOOTBALL_ALLOW_BET_ORPHAN=1`** (see script header — this NULLs those `fixture_id` values).
+4. After a successful run, set **`DATABASE_URL`** back in `backend/.env` to whatever you use for local dev (usually local Postgres).
 
 Script: `scripts/migrate-football-local-to-dest.js` (deletes football-related rows on **dest**, then inserts from **source** in FK order).
 
