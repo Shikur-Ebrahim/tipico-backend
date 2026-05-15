@@ -1,0 +1,43 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "db:setup": "ts-node-dev --transpile-only src/db/setup.ts",
+    "db:init": "ts-node-dev --transpile-only src/db/init.ts",
+    "sync:status": "ts-node-dev --transpile-only src/scripts/sync.ts status",
+    "sync:bootstrap": "ts-node-dev --transpile-only src/scripts/sync.ts bootstrap",
+    "sync:live": "ts-node-dev --transpile-only src/scripts/sync.ts live",
+    "sync:odds": "ts-node-dev --transpile-only src/scripts/sync.ts odds",
+    "sync:fill-week": "ts-node-dev --transpile-only src/scripts/syncFillWeek.ts",
+    "lint": "eslint src/",
+    "db:verify-remote": "node scripts/verify-render-tables.js",
+    "db:apply-remote": "node scripts/apply-cloud-bootstrap.js",
+    "admin:set": "node scripts/set-admin-once.js",
+    "migrate:football": "node scripts/migrate-football-local-to-dest.js"
+  },
+  "dependencies": {
+    "axios": "^1.16.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
+    "node-cron": "^4.2.1",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.13.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/pg": "^8.20.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.7.3"
+  }
+}
