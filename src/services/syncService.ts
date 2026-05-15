@@ -15,7 +15,7 @@ import {
 import { settlePendingBetSlips } from './betSettlementService';
 import pool, { verifyDatabaseConnection } from '../config/database';
 
-const TOP_LEAGUES = [
+export const TOP_LEAGUES = [
   39,  // English Premier League
   2,   // UEFA Champions League
   140, // Spanish La Liga

@@ -91,8 +91,14 @@ type ApiSportsPaged<T> = {
  */
 async function apiGetAllPages<TItem>(
   endpoint: string,
-  baseParams: Record<string, string | number>
+  baseParams: Record<string, string | number>,
+  options?: { paginate?: boolean }
 ): Promise<TItem[]> {
+  if (options?.paginate === false) {
+    const data = await apiGet<ApiSportsPaged<TItem>>(endpoint, baseParams);
+    return Array.isArray(data.response) ? data.response : [];
+  }
+
   const out: TItem[] = [];
   let page = 1;
   let totalPages = 1;
@@ -430,6 +436,23 @@ export async function fetchAndStoreLeagues(topLeagueIds: number[] = []) {
   }
 }
 
+/** Fetch only listed league IDs (fast; avoids processing entire /leagues catalog). */
+export async function fetchAndStoreLeaguesByIds(topLeagueIds: number[]) {
+  const topRanks = new Map<number, number>();
+  topLeagueIds.forEach((id, index) => topRanks.set(id, index + 1));
+
+  for (const leagueId of topLeagueIds) {
+    const data = await apiGet<{
+      response: Array<{ league: ApiLeague; country: ApiCountry; seasons?: ApiSeason[] }>;
+    }>('/leagues', { id: leagueId });
+    for (const item of data.response) {
+      const currentSeason = item.seasons?.find((season) => season.current) || item.seasons?.[0] || null;
+      const countryId = await ensureCountry(item.country);
+      await ensureLeague(item.league, countryId, currentSeason, topRanks.get(leagueId));
+    }
+  }
+}
+
 export async function fetchAndStoreTeams(leagueApiId: number, season: number) {
   const leagueRow = await pool.query('SELECT id FROM leagues WHERE api_league_id = $1', [leagueApiId]);
   const leagueId = leagueRow.rows[0]?.id as number | undefined;
@@ -470,7 +493,11 @@ export async function fetchAndStoreFixturesForRollingWindow() {
 
   while (cursor < endExclusive) {
     const dateStr = formatLocalYmd(cursor);
-    const items = await apiGetAllPages<ApiFixtureResponseItem>('/fixtures', { date: dateStr });
+    const items = await apiGetAllPages<ApiFixtureResponseItem>(
+      '/fixtures',
+      { date: dateStr },
+      { paginate: false }
+    );
     for (const item of items) {
       await ensureFixtureRecord(item);
     }
@@ -548,7 +575,7 @@ async function persistBulkOddsApiItem(item: BulkOddsApiItem) {
 }
 
 export async function fetchAndStoreBulkOddsByDate(dateStr: string) {
-  const items = await apiGetAllPages<BulkOddsApiItem>('/odds', { date: dateStr });
+  const items = await apiGetAllPages<BulkOddsApiItem>('/odds', { date: dateStr }, { paginate: false });
   for (const item of items) {
     await persistBulkOddsApiItem(item);
   }

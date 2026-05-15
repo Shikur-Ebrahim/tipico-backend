@@ -13,6 +13,8 @@
     "sync:live": "ts-node-dev --transpile-only src/scripts/sync.ts live",
     "sync:odds": "ts-node-dev --transpile-only src/scripts/sync.ts odds",
     "sync:fill-week": "ts-node-dev --transpile-only src/scripts/syncFillWeek.ts",
+    "sync:top-week": "ts-node-dev --transpile-only src/scripts/syncTopWeek.ts",
+    "sync:week-auto": "ts-node-dev --transpile-only src/scripts/syncWeekAuto.ts",
     "lint": "eslint src/",
     "db:verify-remote": "node scripts/verify-render-tables.js",
     "db:apply-remote": "node scripts/apply-cloud-bootstrap.js",
