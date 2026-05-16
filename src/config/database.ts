@@ -18,9 +18,12 @@ const basePoolConfig = {
   keepAlive: true,
 };
 
+const databaseUrl = process.env.DATABASE_URL || '';
+/** Render Postgres requires TLS; URL usually includes sslmode=require — enable SSL if missing. */
 const useSsl =
   process.env.DATABASE_SSL === 'true' ||
-  (process.env.DATABASE_URL?.includes('sslmode=require') ?? false);
+  databaseUrl.includes('sslmode=require') ||
+  (databaseUrl.includes('render.com') && process.env.DATABASE_SSL !== 'false');
 
 const pool = process.env.DATABASE_URL
   ? new Pool({

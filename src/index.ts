@@ -15,10 +15,12 @@ import adminRouter from './routes/admin';
 import userRouter from './routes/user';
 
 import { ensureManualPresetSchema } from './db/ensureManualPresetSchema';
+import { ensureWithdrawalMethodsTable } from './db/ensureWithdrawalRequests';
 
 dotenv.config();
 
 void ensureManualPresetSchema().catch((e) => console.error('[DB] ensureManualPresetSchema:', e));
+void ensureWithdrawalMethodsTable().catch((e) => console.error('[DB] ensureWithdrawalMethodsTable:', e));
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -69,6 +71,6 @@ app.use('/api/admin', adminRouter);
 app.use('/api/user', userRouter);
 
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`API listening on port ${PORT}`);
   startSyncJobs();
 });

@@ -358,11 +358,14 @@ router.get('/history/:userId', async (req: Request, res: Response) => {
             'home_logo', bsel.home_logo,
             'away_logo', bsel.away_logo,
             'league_name', bsel.league_name,
-            'market_name', bsel.market_name
+            'market_name', bsel.market_name,
+            'kickoff_at', COALESCE(bsel.manual_kickoff_at, f.match_date)
           )
+          ORDER BY bsel.id
         ) FILTER (WHERE bsel.id IS NOT NULL), '[]') as selections
        FROM bet_slips bs
        LEFT JOIN bet_selections bsel ON bs.id = bsel.bet_slip_id
+       LEFT JOIN fixtures f ON f.id = bsel.fixture_id
        WHERE bs.user_id = $1
        GROUP BY bs.id
        ORDER BY bs.created_at DESC`,
