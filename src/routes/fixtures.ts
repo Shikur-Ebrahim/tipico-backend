@@ -3,7 +3,7 @@ import pool from '../config/database';
 
 import { getFixtureWindowRange } from '../services/apiFootball';
 import { runBootstrapSync, runOddsSync } from '../services/syncService';
-import { sqlFixtureHasDisplayableOdds } from '../utils/displayableOdds';
+import { sqlFixtureHasDisplayableOdds, sqlMarketIsDisplayable } from '../utils/displayableOdds';
 import { buildRollingDayIds, getDayRangeFromId } from '../utils/fixtureDayFilter';
 
 const router = Router();
@@ -270,6 +270,108 @@ router.get('/', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[fixtures] list failed:', err);
     res.status(200).json([]);
+  }
+});
+
+/** Home page: fixtures + 1X2 odds in one round-trip (avoids slow meta + bulk odds on cold DB). */
+router.get('/home', async (req: Request, res: Response) => {
+  try {
+    const {
+      api_league_id,
+      country,
+      day,
+      limit = '100',
+    } = req.query;
+    const rawLimit = parseInt(limit as string, 10);
+    const pageLimit = Number.isFinite(rawLimit)
+      ? Math.min(MAX_FIXTURES_PAGE, Math.max(1, rawLimit))
+      : 100;
+
+    let query = `
+      SELECT f.*,
+        ht.name as home_team_name, ht.logo as home_team_logo,
+        at.name as away_team_name, at.logo as away_team_logo,
+        l.name as league_name, l.logo as league_logo, l.api_league_id,
+        c.name as country_name, c.flag_url,
+        v.name as venue_name, v.city as venue_city
+      FROM fixtures f
+      JOIN teams ht ON f.home_team_id = ht.id
+      JOIN teams at ON f.away_team_id = at.id
+      JOIN leagues l ON f.league_id = l.id
+      LEFT JOIN countries c ON l.country_id = c.id
+      LEFT JOIN venues v ON f.venue_id = v.id
+      WHERE ${sqlFixtureHasDisplayableOdds('f')}
+    `;
+    const params: (string | number | Date)[] = [];
+    let paramIndex = 1;
+
+    if (api_league_id) {
+      query += ` AND l.api_league_id = $${paramIndex++}`;
+      params.push(parseInt(api_league_id as string, 10));
+    }
+    if (country && country !== 'All countries') {
+      if (country === 'International') {
+        query += ` AND c.name IS NULL`;
+      } else {
+        query += ` AND c.name = $${paramIndex++}`;
+        params.push(country as string);
+      }
+    }
+    if (typeof day === 'string' && day !== 'all') {
+      const range = getDayRangeFromId(day);
+      if (range) {
+        query += ` AND f.match_date >= $${paramIndex++} AND f.match_date < $${paramIndex++}`;
+        params.push(range.start, range.endExclusive);
+      }
+    }
+
+    const { start, endExclusive } = getFixtureWindowRange();
+    query += ` AND f.match_date >= $${paramIndex++} AND f.match_date < $${paramIndex++}`;
+    params.push(start, endExclusive);
+    query += ` AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')`;
+
+    query += ` ORDER BY 
+      l.is_top DESC,
+      l.top_rank ASC NULLS LAST,
+      (CASE 
+        WHEN f.status IN ('1H', '2H', 'HT', 'ET', 'P', 'LIVE') THEN 0 
+        WHEN f.status = 'NS' THEN 1 
+        ELSE 2 
+      END) ASC,
+      f.match_date ASC LIMIT $${paramIndex++}`;
+    params.push(pageLimit);
+
+    const { rows: fixtures } = await pool.query(query, params);
+    const ids = fixtures.map((f: { id: number }) => f.id);
+    const odds: Record<string, unknown[]> = {};
+
+    if (ids.length > 0) {
+      const { rows: oddsRows } = await pool.query(
+        `SELECT DISTINCT ON (o.fixture_id, bm.id, o.selection)
+          o.*, b.name as bookmaker_name, b.logo as bookmaker_logo,
+          bm.name as market_name, bm.market_key
+         FROM odds o
+         JOIN bookmakers b ON o.bookmaker_id = b.id
+         JOIN bet_markets bm ON o.market_id = bm.id
+         WHERE o.fixture_id = ANY($1::int[])
+           AND o.odd_value IS NOT NULL
+           AND o.odd_value > 0
+           AND ${sqlMarketIsDisplayable('bm')}
+         ORDER BY o.fixture_id, bm.id, o.selection, o.last_update DESC NULLS LAST,
+           CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END, b.id`,
+        [ids]
+      );
+      for (const row of oddsRows) {
+        const fid = String((row as { fixture_id: number }).fixture_id);
+        if (!odds[fid]) odds[fid] = [];
+        odds[fid].push(row);
+      }
+    }
+
+    res.json({ fixtures, odds });
+  } catch (err) {
+    console.error('[fixtures/home]', err);
+    res.status(200).json({ fixtures: [], odds: {} });
   }
 });
 

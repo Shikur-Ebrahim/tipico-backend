@@ -50,7 +50,7 @@ router.get('/bulk', async (req: Request, res: Response) => {
     res.json(byFixture);
   } catch (err) {
     console.error('Bulk odds error:', err);
-    res.status(500).json({ error: 'Failed to fetch bulk odds' });
+    res.status(200).json({});
   }
 });
 
