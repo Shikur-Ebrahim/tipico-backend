@@ -130,7 +130,7 @@ export async function validatePromotionCodeForUser(
   const lookupPhone = await resolveStoredPhone(userPhone).catch(() => userPhone);
   const code = String(promoCode ?? '').trim().toUpperCase();
   if (!code || !CODE_PATTERN.test(code)) {
-    return { valid: false, message: 'Please enter correct promo code' };
+    return { valid: false, message: 'Please enter correct agent ID code' };
   }
 
   const row = await pool.query(
@@ -144,7 +144,7 @@ export async function validatePromotionCodeForUser(
     };
   }
   if (row.rows[0].code !== code) {
-    return { valid: false, message: 'Please enter correct promo code' };
+    return { valid: false, message: 'Please enter correct agent ID code' };
   }
   return { valid: true };
 }
