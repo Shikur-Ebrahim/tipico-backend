@@ -2,6 +2,12 @@ import { Router, Request, Response } from 'express';
 import pool from '../config/database';
 
 import { getFixtureWindowRange } from '../services/apiFootball';
+import {
+  buildHomeBootstrapPayload,
+  queryFixtureCountryCounts,
+  queryFixtureDayCounts,
+  queryHomeFeed,
+} from '../services/homeBootstrapService';
 import { runBootstrapSync, runOddsSync } from '../services/syncService';
 import { sqlFixtureHasDisplayableOdds, sqlMarketIsDisplayable } from '../utils/displayableOdds';
 import { buildRollingDayIds, getDayRangeFromId } from '../utils/fixtureDayFilter';
@@ -73,46 +79,7 @@ function emptyFixtureMeta() {
   };
 }
 
-async function queryFixtureDayCounts(onlyWithOdds: boolean) {
-  const { start: windowStart, endExclusive: windowEnd } = getFixtureWindowRange();
-  const oddsSql = onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : '';
-  const baseFrom = `
-      FROM fixtures f
-      JOIN leagues l ON f.league_id = l.id
-      WHERE f.match_date >= $1 AND f.match_date < $2
-        AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')
-        ${oddsSql}`;
-
-  const dayIds = buildRollingDayIds().filter((id) => id !== 'all');
-  const dayFilters: string[] = [];
-  const dayParams: (string | number | Date)[] = [windowStart, windowEnd];
-  let p = 3;
-  for (const dayId of dayIds) {
-    const range = getDayRangeFromId(dayId);
-    if (!range) continue;
-    const key = dayId.replace(/[^a-z0-9_]/gi, '_');
-    dayFilters.push(
-      `COUNT(*) FILTER (WHERE f.match_date >= $${p} AND f.match_date < $${p + 1})::int AS d_${key}`
-    );
-    dayParams.push(range.start, range.endExclusive);
-    p += 2;
-  }
-
-  const { rows: aggRows } = await pool.query<Record<string, number>>(
-    `SELECT COUNT(*)::int AS total${dayFilters.length ? `, ${dayFilters.join(', ')}` : ''} ${baseFrom}`,
-    dayParams
-  );
-  const agg = aggRows[0] || { total: 0 };
-  const total = Number(agg.total) || 0;
-  const days: { id: string; count: number }[] = [{ id: 'all', count: total }];
-  for (const dayId of dayIds) {
-    const key = `d_${dayId.replace(/[^a-z0-9_]/gi, '_')}`;
-    days.push({ id: dayId, count: Number(agg[key]) || 0 });
-  }
-  return { total, days };
-}
-
-/** Fast day dropdown counts only (no country breakdown). */
+/** Fast day + country dropdown counts (single round-trip). */
 router.get('/meta/summary', async (req: Request, res: Response) => {
   try {
     const onlyWithOdds =
@@ -120,23 +87,32 @@ router.get('/meta/summary', async (req: Request, res: Response) => {
       req.query.has_odds === 'true' ||
       req.query.has_odds === 'yes';
     const cacheKey = `meta-summary:${onlyWithOdds ? '1' : '0'}`;
-    const cached = getCachedResponse<{ total: number; days: { id: string; count: number }[] }>(
-      cacheKey
-    );
+    const cached = getCachedResponse<{
+      total: number;
+      days: { id: string; count: number }[];
+      countries: { name: string; count: number; flag_url: string | null }[];
+    }>(cacheKey);
     if (cached) {
       res.setHeader('Cache-Control', 'public, max-age=30');
       res.json(cached);
       return;
     }
 
-    const { total, days } = await queryFixtureDayCounts(onlyWithOdds);
-    const payload = { total, days };
+    const [{ total, days }, countries] = await Promise.all([
+      queryFixtureDayCounts(onlyWithOdds),
+      queryFixtureCountryCounts(onlyWithOdds),
+    ]);
+    const payload = { total, days, countries };
     setCachedResponse(cacheKey, payload);
     res.setHeader('Cache-Control', 'public, max-age=30');
     res.json(payload);
   } catch (err) {
     console.error('[fixtures/meta/summary]', err);
-    res.status(200).json({ total: 0, days: buildRollingDayIds().map((id) => ({ id, count: 0 })) });
+    res.status(200).json({
+      total: 0,
+      days: buildRollingDayIds().map((id) => ({ id, count: 0 })),
+      countries: [],
+    });
   }
 });
 
@@ -350,96 +326,52 @@ router.get('/home', async (req: Request, res: Response) => {
       ? Math.min(MAX_FIXTURES_PAGE, Math.max(1, rawLimit))
       : 100;
 
-    let query = `
-      SELECT f.*,
-        ht.name as home_team_name, ht.logo as home_team_logo,
-        at.name as away_team_name, at.logo as away_team_logo,
-        l.name as league_name, l.logo as league_logo, l.api_league_id,
-        c.name as country_name, c.flag_url,
-        v.name as venue_name, v.city as venue_city
-      FROM fixtures f
-      JOIN teams ht ON f.home_team_id = ht.id
-      JOIN teams at ON f.away_team_id = at.id
-      JOIN leagues l ON f.league_id = l.id
-      LEFT JOIN countries c ON l.country_id = c.id
-      LEFT JOIN venues v ON f.venue_id = v.id
-      WHERE ${sqlFixtureHasDisplayableOdds('f')}
-    `;
-    const params: (string | number | Date)[] = [];
-    let paramIndex = 1;
-
-    if (api_league_id) {
-      query += ` AND l.api_league_id = $${paramIndex++}`;
-      params.push(parseInt(api_league_id as string, 10));
-    }
-    if (country && country !== 'All countries') {
-      if (country === 'International') {
-        query += ` AND c.name IS NULL`;
-      } else {
-        query += ` AND c.name = $${paramIndex++}`;
-        params.push(country as string);
-      }
-    }
-    if (typeof day === 'string' && day !== 'all') {
-      const range = getDayRangeFromId(day);
-      if (range) {
-        query += ` AND f.match_date >= $${paramIndex++} AND f.match_date < $${paramIndex++}`;
-        params.push(range.start, range.endExclusive);
-      }
-    }
-
-    const { start, endExclusive } = getFixtureWindowRange();
-    query += ` AND f.match_date >= $${paramIndex++} AND f.match_date < $${paramIndex++}`;
-    params.push(start, endExclusive);
-    query += ` AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')`;
-
-    query += ` ORDER BY 
-      l.is_top DESC,
-      l.top_rank ASC NULLS LAST,
-      (CASE 
-        WHEN f.status IN ('1H', '2H', 'HT', 'ET', 'P', 'LIVE') THEN 0 
-        WHEN f.status = 'NS' THEN 1 
-        ELSE 2 
-      END) ASC,
-      f.match_date ASC LIMIT $${paramIndex++}`;
-    params.push(pageLimit);
-
-    const { rows: fixtures } = await pool.query(query, params);
-    const ids = fixtures.map((f: { id: number }) => f.id);
-    const odds: Record<string, unknown[]> = {};
-
-    if (ids.length > 0) {
-      const { rows: oddsRows } = await pool.query(
-        `SELECT DISTINCT ON (o.fixture_id, o.selection)
-          o.id, o.fixture_id, o.bookmaker_id, o.market_id, o.selection, o.odd_value, o.last_update,
-          b.name as bookmaker_name, b.logo as bookmaker_logo,
-          bm.name as market_name, bm.market_key
-         FROM odds o
-         JOIN bookmakers b ON o.bookmaker_id = b.id
-         JOIN bet_markets bm ON o.market_id = bm.id
-         WHERE o.fixture_id = ANY($1::int[])
-           AND o.odd_value IS NOT NULL
-           AND o.odd_value > 0
-           AND (bm.market_key = '1' OR LOWER(bm.market_key) = '1x2')
-           AND o.selection IN ('Home', 'Draw', 'Away', '1', 'X', '2')
-         ORDER BY o.fixture_id, o.selection, o.last_update DESC NULLS LAST,
-           CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END`,
-        [ids]
-      );
-      for (const row of oddsRows) {
-        const fid = String((row as { fixture_id: number }).fixture_id);
-        if (!odds[fid]) odds[fid] = [];
-        odds[fid].push(row);
-      }
-    }
-
-    const payload = { fixtures, odds };
+    const payload = await queryHomeFeed({
+      pageLimit,
+      day: typeof day === 'string' ? day : undefined,
+      country: typeof country === 'string' ? country : undefined,
+      api_league_id: api_league_id
+        ? parseInt(api_league_id as string, 10)
+        : undefined,
+    });
     setCachedResponse(cacheKey, payload);
     res.setHeader('Cache-Control', 'public, max-age=30');
     res.json(payload);
   } catch (err) {
     console.error('[fixtures/home]', err);
     res.status(200).json({ fixtures: [], odds: {} });
+  }
+});
+
+/** Landing page: matches + 7-day counts + countries + top leagues in one HTTP call. */
+router.get('/bootstrap', async (req: Request, res: Response) => {
+  try {
+    const rawLimit = parseInt((req.query.limit as string) || '100', 10);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(MAX_FIXTURES_PAGE, Math.max(1, rawLimit))
+      : 100;
+    const cacheKey = `bootstrap:${limit}`;
+    const cached = getCachedResponse<Awaited<ReturnType<typeof buildHomeBootstrapPayload>>>(
+      cacheKey,
+      60_000
+    );
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.json(cached);
+      return;
+    }
+    const payload = await buildHomeBootstrapPayload(limit);
+    setCachedResponse(cacheKey, payload);
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.json(payload);
+  } catch (err) {
+    console.error('[fixtures/bootstrap]', err);
+    res.status(200).json({
+      fixtures: [],
+      odds: {},
+      meta: emptyFixtureMeta(),
+      topLeagues: [],
+    });
   }
 });
 

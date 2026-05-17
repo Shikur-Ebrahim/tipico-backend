@@ -354,6 +354,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_odds_fixture_bookmaker_market_selection ON 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_live_matches_fixture_id ON live_matches(fixture_id);
 CREATE INDEX IF NOT EXISTS idx_fixtures_league ON fixtures(league_id);
 CREATE INDEX IF NOT EXISTS idx_fixtures_date ON fixtures(match_date);
+CREATE INDEX IF NOT EXISTS idx_fixtures_date_status ON fixtures(match_date, status);
 CREATE INDEX IF NOT EXISTS idx_fixtures_status ON fixtures(status);
 CREATE INDEX IF NOT EXISTS idx_fixtures_api ON fixtures(api_fixture_id);
 CREATE INDEX IF NOT EXISTS idx_odds_fixture ON odds(fixture_id);
