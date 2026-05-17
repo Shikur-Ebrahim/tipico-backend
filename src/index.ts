@@ -13,6 +13,7 @@ import syncRouter from './routes/sync';
 import authRouter from './routes/auth';
 import adminRouter from './routes/admin';
 import userRouter from './routes/user';
+import chatRouter from './routes/chat';
 
 import { ensureBetSlipSchema } from './db/ensureBetSlipSchema';
 import { ensureWithdrawalMethodsTable } from './db/ensureWithdrawalRequests';
@@ -67,6 +68,7 @@ app.use('/api/sync', syncRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/user', userRouter);
+app.use('/api/chat', chatRouter);
 
 async function startServer() {
   try {
