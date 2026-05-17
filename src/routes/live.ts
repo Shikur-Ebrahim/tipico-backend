@@ -20,6 +20,7 @@ router.get('/matches', async (_req: Request, res: Response) => {
        WHERE lm.is_active = true
        ORDER BY f.match_date ASC`
     );
+    res.setHeader('Cache-Control', 'no-store');
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch live matches' });

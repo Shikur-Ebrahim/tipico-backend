@@ -47,6 +47,7 @@ router.get('/bulk', async (req: Request, res: Response) => {
       if (!byFixture[fid]) byFixture[fid] = [];
       byFixture[fid].push(row);
     }
+    res.setHeader('Cache-Control', 'no-store');
     res.json(byFixture);
   } catch (err) {
     console.error('Bulk odds error:', err);
@@ -66,6 +67,7 @@ router.get('/fixture/:fixtureId', async (req: Request, res: Response) => {
          CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END, b.id`,
       [req.params.fixtureId]
     );
+    res.setHeader('Cache-Control', 'no-store');
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch odds' });
