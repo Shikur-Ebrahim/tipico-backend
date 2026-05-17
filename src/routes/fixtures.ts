@@ -353,16 +353,16 @@ router.get('/bootstrap', async (req: Request, res: Response) => {
     const cacheKey = `bootstrap:${limit}`;
     const cached = getCachedResponse<Awaited<ReturnType<typeof buildHomeBootstrapPayload>>>(
       cacheKey,
-      60_000
+      120_000
     );
     if (cached) {
-      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.setHeader('Cache-Control', 'public, max-age=120');
       res.json(cached);
       return;
     }
     const payload = await buildHomeBootstrapPayload(limit);
-    setCachedResponse(cacheKey, payload);
-    res.setHeader('Cache-Control', 'public, max-age=60');
+    setCachedResponse(cacheKey, payload, 120_000);
+    res.setHeader('Cache-Control', 'public, max-age=120');
     res.json(payload);
   } catch (err) {
     console.error('[fixtures/bootstrap]', err);

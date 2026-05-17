@@ -82,13 +82,41 @@ export async function queryFixtureCountryCounts(onlyWithOdds: boolean) {
   return rows;
 }
 
-/** Fixtures + 1X2 odds for the home list (shared by /home and /bootstrap). */
-export async function queryHomeFeed(opts: {
+async function queryOddsForFixtureIds(ids: number[]): Promise<Record<string, unknown[]>> {
+  const odds: Record<string, unknown[]> = {};
+  if (ids.length === 0) return odds;
+  const { rows: oddsRows } = await pool.query(
+    `SELECT DISTINCT ON (o.fixture_id, o.selection)
+        o.id, o.fixture_id, o.bookmaker_id, o.market_id, o.selection, o.odd_value, o.last_update,
+        b.name as bookmaker_name, b.logo as bookmaker_logo,
+        bm.name as market_name, bm.market_key
+       FROM odds o
+       JOIN bookmakers b ON o.bookmaker_id = b.id
+       JOIN bet_markets bm ON o.market_id = bm.id
+       WHERE o.fixture_id = ANY($1::int[])
+         AND o.odd_value IS NOT NULL
+         AND o.odd_value > 0
+         AND (bm.market_key = '1' OR LOWER(bm.market_key) = '1x2')
+         AND o.selection IN ('Home', 'Draw', 'Away', '1', 'X', '2')
+       ORDER BY o.fixture_id, o.selection, o.last_update DESC NULLS LAST,
+         CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END`,
+    [ids]
+  );
+  for (const row of oddsRows) {
+    const fid = String((row as { fixture_id: number }).fixture_id);
+    if (!odds[fid]) odds[fid] = [];
+    odds[fid].push(row);
+  }
+  return odds;
+}
+
+/** Fixture rows only (no odds) — used to parallelize bootstrap. */
+export async function queryHomeFeedList(opts: {
   pageLimit: number;
   day?: string;
   country?: string;
   api_league_id?: number;
-}): Promise<HomeFeedPayload> {
+}): Promise<unknown[]> {
   const pageLimit = Math.min(MAX_FIXTURES_PAGE, Math.max(1, opts.pageLimit));
 
   let query = `
@@ -146,35 +174,82 @@ export async function queryHomeFeed(opts: {
   params.push(pageLimit);
 
   const { rows: fixtures } = await pool.query(query, params);
-  const ids = fixtures.map((f: { id: number }) => f.id);
-  const odds: Record<string, unknown[]> = {};
+  return fixtures;
+}
 
-  if (ids.length > 0) {
-    const { rows: oddsRows } = await pool.query(
-      `SELECT DISTINCT ON (o.fixture_id, o.selection)
-          o.id, o.fixture_id, o.bookmaker_id, o.market_id, o.selection, o.odd_value, o.last_update,
-          b.name as bookmaker_name, b.logo as bookmaker_logo,
-          bm.name as market_name, bm.market_key
-         FROM odds o
-         JOIN bookmakers b ON o.bookmaker_id = b.id
-         JOIN bet_markets bm ON o.market_id = bm.id
-         WHERE o.fixture_id = ANY($1::int[])
-           AND o.odd_value IS NOT NULL
-           AND o.odd_value > 0
-           AND (bm.market_key = '1' OR LOWER(bm.market_key) = '1x2')
-           AND o.selection IN ('Home', 'Draw', 'Away', '1', 'X', '2')
-         ORDER BY o.fixture_id, o.selection, o.last_update DESC NULLS LAST,
-           CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END`,
-      [ids]
+/** Fixtures + 1X2 odds for the home list (shared by /home and /bootstrap). */
+export async function queryHomeFeed(opts: {
+  pageLimit: number;
+  day?: string;
+  country?: string;
+  api_league_id?: number;
+}): Promise<HomeFeedPayload> {
+  const fixtures = await queryHomeFeedList(opts);
+  const ids = (fixtures as { id: number }[]).map((f) => f.id);
+  const odds = await queryOddsForFixtureIds(ids);
+  return { fixtures, odds };
+}
+
+/** Day + country dropdown counts in one DB scan. */
+export async function queryCombinedFixtureMeta(onlyWithOdds: boolean) {
+  const { start: windowStart, endExclusive: windowEnd } = getFixtureWindowRange();
+  const oddsSql = onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : '';
+  const dayIds = buildRollingDayIds().filter((id) => id !== 'all');
+  const dayFilters: string[] = [];
+  const params: (string | number | Date)[] = [windowStart, windowEnd];
+  let p = 3;
+  for (const dayId of dayIds) {
+    const range = getDayRangeFromId(dayId);
+    if (!range) continue;
+    const key = dayId.replace(/[^a-z0-9_]/gi, '_');
+    dayFilters.push(
+      `COUNT(*) FILTER (WHERE match_date >= $${p} AND match_date < $${p + 1})::int AS d_${key}`
     );
-    for (const row of oddsRows) {
-      const fid = String((row as { fixture_id: number }).fixture_id);
-      if (!odds[fid]) odds[fid] = [];
-      odds[fid].push(row);
-    }
+    params.push(range.start, range.endExclusive);
+    p += 2;
   }
 
-  return { fixtures, odds };
+  const { rows } = await pool.query<Record<string, unknown>>(
+    `WITH base AS (
+      SELECT f.match_date,
+        COALESCE(c.name, 'International') AS country_name,
+        c.flag_url
+      FROM fixtures f
+      JOIN leagues l ON f.league_id = l.id
+      LEFT JOIN countries c ON l.country_id = c.id
+      WHERE f.match_date >= $1 AND f.match_date < $2
+        AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')
+        ${oddsSql}
+    )
+    SELECT COUNT(*)::int AS total${dayFilters.length ? `, ${dayFilters.join(', ')}` : ''},
+      (
+        SELECT COALESCE(
+          json_agg(row_to_json(t) ORDER BY t.count DESC, t.name ASC),
+          '[]'::json
+        )
+        FROM (
+          SELECT country_name AS name,
+            COUNT(*)::int AS count,
+            MAX(flag_url) AS flag_url
+          FROM base
+          GROUP BY country_name
+        ) t
+      ) AS countries_json
+    FROM base`,
+    params
+  );
+
+  const agg = rows[0] || { total: 0, countries_json: [] };
+  const total = Number(agg.total) || 0;
+  const days: { id: string; count: number }[] = [{ id: 'all', count: total }];
+  for (const dayId of dayIds) {
+    const key = `d_${dayId.replace(/[^a-z0-9_]/gi, '_')}`;
+    days.push({ id: dayId, count: Number(agg[key]) || 0 });
+  }
+  const countryRows = Array.isArray(agg.countries_json)
+    ? (agg.countries_json as { name: string; count: number; flag_url: string | null }[])
+    : [];
+  return { total, days, countryRows };
 }
 
 async function queryTopLeagues() {
@@ -189,19 +264,23 @@ async function queryTopLeagues() {
   return rows;
 }
 
-/** One DB round-trip batch for landing: matches, 7-day counts, countries, top leagues. */
+/** Landing bundle: list first, then odds + meta + leagues in parallel (faster TTFB). */
 export async function buildHomeBootstrapPayload(limit: number): Promise<HomeBootstrapPayload> {
   const onlyWithOdds = true;
-  const [home, { total, days }, countryRows, topLeagues] = await Promise.all([
-    queryHomeFeed({ pageLimit: limit }),
-    queryFixtureDayCounts(onlyWithOdds),
-    queryFixtureCountryCounts(onlyWithOdds),
+  const fixtures = await queryHomeFeedList({ pageLimit: limit });
+  const ids = (fixtures as { id: number }[]).map((f) => f.id);
+
+  const [odds, metaCombined, topLeagues] = await Promise.all([
+    queryOddsForFixtureIds(ids),
+    queryCombinedFixtureMeta(onlyWithOdds),
     queryTopLeagues(),
   ]);
 
+  const { total, days, countryRows } = metaCombined;
+
   return {
-    fixtures: home.fixtures,
-    odds: home.odds,
+    fixtures,
+    odds,
     meta: {
       total,
       days,
