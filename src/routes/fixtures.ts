@@ -64,6 +64,14 @@ function listAllFixturesInDb(): boolean {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
+function emptyFixtureMeta() {
+  return {
+    total: 0,
+    days: buildRollingDayIds().map((id) => ({ id, count: 0 })),
+    countries: [{ name: 'All countries', count: 0, flag_url: null as string | null }],
+  };
+}
+
 router.get('/meta', async (req: Request, res: Response) => {
   try {
     const onlyWithOdds =
@@ -73,46 +81,51 @@ router.get('/meta', async (req: Request, res: Response) => {
     const countryDay = typeof req.query.day === 'string' ? req.query.day : 'all';
     const { start: windowStart, endExclusive: windowEnd } = getFixtureWindowRange();
 
-    const baseWhere = `
+    const oddsSql = onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : '';
+    const baseFrom = `
       FROM fixtures f
       JOIN leagues l ON f.league_id = l.id
       LEFT JOIN countries c ON l.country_id = c.id
       WHERE f.match_date >= $1 AND f.match_date < $2
         AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')
-        ${onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : ''}
-    `;
-    const baseParams: (string | number | Date)[] = [windowStart, windowEnd];
+        ${oddsSql}`;
 
-    const { rows: totalRows } = await pool.query<{ n: number }>(
-      `SELECT COUNT(*)::int AS n ${baseWhere}`,
-      baseParams
-    );
-    const total = totalRows[0]?.n ?? 0;
-
-    const days: { id: string; count: number }[] = [];
-    for (const dayId of buildRollingDayIds()) {
-      if (dayId === 'all') {
-        days.push({ id: 'all', count: total });
-        continue;
-      }
+    const dayIds = buildRollingDayIds().filter((id) => id !== 'all');
+    const dayFilters: string[] = [];
+    const dayParams: (string | number | Date)[] = [windowStart, windowEnd];
+    let p = 3;
+    for (const dayId of dayIds) {
       const range = getDayRangeFromId(dayId);
       if (!range) continue;
-      const { rows } = await pool.query<{ n: number }>(
-        `SELECT COUNT(*)::int AS n ${baseWhere}
-         AND f.match_date >= $3 AND f.match_date < $4`,
-        [...baseParams, range.start, range.endExclusive]
+      const key = dayId.replace(/[^a-z0-9_]/gi, '_');
+      dayFilters.push(
+        `COUNT(*) FILTER (WHERE f.match_date >= $${p} AND f.match_date < $${p + 1})::int AS d_${key}`
       );
-      days.push({ id: dayId, count: rows[0]?.n ?? 0 });
+      dayParams.push(range.start, range.endExclusive);
+      p += 2;
+    }
+
+    const { rows: aggRows } = await pool.query<Record<string, number>>(
+      `SELECT COUNT(*)::int AS total${dayFilters.length ? `, ${dayFilters.join(', ')}` : ''} ${baseFrom}`,
+      dayParams
+    );
+    const agg = aggRows[0] || { total: 0 };
+    const total = Number(agg.total) || 0;
+
+    const days: { id: string; count: number }[] = [{ id: 'all', count: total }];
+    for (const dayId of dayIds) {
+      const key = `d_${dayId.replace(/[^a-z0-9_]/gi, '_')}`;
+      days.push({ id: dayId, count: Number(agg[key]) || 0 });
     }
 
     let countrySql = `SELECT COALESCE(c.name, 'International') AS name,
         MAX(c.flag_url) AS flag_url,
         COUNT(*)::int AS count
-      ${baseWhere}`;
-    const countryParams = [...baseParams];
+      ${baseFrom}`;
+    const countryParams: (string | number | Date)[] = [windowStart, windowEnd];
     const dayRange = getDayRangeFromId(countryDay);
     if (dayRange) {
-      countrySql += ` AND f.match_date >= $${countryParams.length + 1} AND f.match_date < $${countryParams.length + 2}`;
+      countrySql += ` AND f.match_date >= $3 AND f.match_date < $4`;
       countryParams.push(dayRange.start, dayRange.endExclusive);
     }
     countrySql += ` GROUP BY COALESCE(c.name, 'International') ORDER BY name ASC`;
@@ -139,7 +152,7 @@ router.get('/meta', async (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error('[fixtures/meta]', err);
-    res.status(500).json({ error: 'Failed to fetch fixture meta' });
+    res.status(200).json(emptyFixtureMeta());
   }
 });
 
@@ -255,7 +268,8 @@ router.get('/', async (req: Request, res: Response) => {
     });
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch fixtures' });
+    console.error('[fixtures] list failed:', err);
+    res.status(200).json([]);
   }
 });
 
