@@ -5,6 +5,7 @@ import { getFixtureWindowRange } from '../services/apiFootball';
 import { runBootstrapSync, runOddsSync } from '../services/syncService';
 import { sqlFixtureHasDisplayableOdds, sqlMarketIsDisplayable } from '../utils/displayableOdds';
 import { buildRollingDayIds, getDayRangeFromId } from '../utils/fixtureDayFilter';
+import { getCachedResponse, setCachedResponse } from '../utils/responseCache';
 
 const router = Router();
 
@@ -72,14 +73,91 @@ function emptyFixtureMeta() {
   };
 }
 
+async function queryFixtureDayCounts(onlyWithOdds: boolean) {
+  const { start: windowStart, endExclusive: windowEnd } = getFixtureWindowRange();
+  const oddsSql = onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : '';
+  const baseFrom = `
+      FROM fixtures f
+      JOIN leagues l ON f.league_id = l.id
+      WHERE f.match_date >= $1 AND f.match_date < $2
+        AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')
+        ${oddsSql}`;
+
+  const dayIds = buildRollingDayIds().filter((id) => id !== 'all');
+  const dayFilters: string[] = [];
+  const dayParams: (string | number | Date)[] = [windowStart, windowEnd];
+  let p = 3;
+  for (const dayId of dayIds) {
+    const range = getDayRangeFromId(dayId);
+    if (!range) continue;
+    const key = dayId.replace(/[^a-z0-9_]/gi, '_');
+    dayFilters.push(
+      `COUNT(*) FILTER (WHERE f.match_date >= $${p} AND f.match_date < $${p + 1})::int AS d_${key}`
+    );
+    dayParams.push(range.start, range.endExclusive);
+    p += 2;
+  }
+
+  const { rows: aggRows } = await pool.query<Record<string, number>>(
+    `SELECT COUNT(*)::int AS total${dayFilters.length ? `, ${dayFilters.join(', ')}` : ''} ${baseFrom}`,
+    dayParams
+  );
+  const agg = aggRows[0] || { total: 0 };
+  const total = Number(agg.total) || 0;
+  const days: { id: string; count: number }[] = [{ id: 'all', count: total }];
+  for (const dayId of dayIds) {
+    const key = `d_${dayId.replace(/[^a-z0-9_]/gi, '_')}`;
+    days.push({ id: dayId, count: Number(agg[key]) || 0 });
+  }
+  return { total, days };
+}
+
+/** Fast day dropdown counts only (no country breakdown). */
+router.get('/meta/summary', async (req: Request, res: Response) => {
+  try {
+    const onlyWithOdds =
+      req.query.has_odds === '1' ||
+      req.query.has_odds === 'true' ||
+      req.query.has_odds === 'yes';
+    const cacheKey = `meta-summary:${onlyWithOdds ? '1' : '0'}`;
+    const cached = getCachedResponse<{ total: number; days: { id: string; count: number }[] }>(
+      cacheKey
+    );
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=30');
+      res.json(cached);
+      return;
+    }
+
+    const { total, days } = await queryFixtureDayCounts(onlyWithOdds);
+    const payload = { total, days };
+    setCachedResponse(cacheKey, payload);
+    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.json(payload);
+  } catch (err) {
+    console.error('[fixtures/meta/summary]', err);
+    res.status(200).json({ total: 0, days: buildRollingDayIds().map((id) => ({ id, count: 0 })) });
+  }
+});
+
 router.get('/meta', async (req: Request, res: Response) => {
   try {
+    const cacheKey = `meta:${req.query.has_odds || ''}:${req.query.day || 'all'}`;
+    const cached = getCachedResponse<Record<string, unknown>>(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=30');
+      res.json(cached);
+      return;
+    }
+
     const onlyWithOdds =
       req.query.has_odds === '1' ||
       req.query.has_odds === 'true' ||
       req.query.has_odds === 'yes';
     const countryDay = typeof req.query.day === 'string' ? req.query.day : 'all';
     const { start: windowStart, endExclusive: windowEnd } = getFixtureWindowRange();
+
+    const { total, days } = await queryFixtureDayCounts(onlyWithOdds);
 
     const oddsSql = onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : '';
     const baseFrom = `
@@ -89,34 +167,6 @@ router.get('/meta', async (req: Request, res: Response) => {
       WHERE f.match_date >= $1 AND f.match_date < $2
         AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')
         ${oddsSql}`;
-
-    const dayIds = buildRollingDayIds().filter((id) => id !== 'all');
-    const dayFilters: string[] = [];
-    const dayParams: (string | number | Date)[] = [windowStart, windowEnd];
-    let p = 3;
-    for (const dayId of dayIds) {
-      const range = getDayRangeFromId(dayId);
-      if (!range) continue;
-      const key = dayId.replace(/[^a-z0-9_]/gi, '_');
-      dayFilters.push(
-        `COUNT(*) FILTER (WHERE f.match_date >= $${p} AND f.match_date < $${p + 1})::int AS d_${key}`
-      );
-      dayParams.push(range.start, range.endExclusive);
-      p += 2;
-    }
-
-    const { rows: aggRows } = await pool.query<Record<string, number>>(
-      `SELECT COUNT(*)::int AS total${dayFilters.length ? `, ${dayFilters.join(', ')}` : ''} ${baseFrom}`,
-      dayParams
-    );
-    const agg = aggRows[0] || { total: 0 };
-    const total = Number(agg.total) || 0;
-
-    const days: { id: string; count: number }[] = [{ id: 'all', count: total }];
-    for (const dayId of dayIds) {
-      const key = `d_${dayId.replace(/[^a-z0-9_]/gi, '_')}`;
-      days.push({ id: dayId, count: Number(agg[key]) || 0 });
-    }
 
     let countrySql = `SELECT COALESCE(c.name, 'International') AS name,
         MAX(c.flag_url) AS flag_url,
@@ -138,7 +188,7 @@ router.get('/meta', async (req: Request, res: Response) => {
 
     const countryTotal = countryRows.reduce((sum, row) => sum + row.count, 0);
 
-    res.json({
+    const payload = {
       total,
       days,
       countries: [
@@ -149,7 +199,10 @@ router.get('/meta', async (req: Request, res: Response) => {
           flag_url: r.flag_url,
         })),
       ],
-    });
+    };
+    setCachedResponse(cacheKey, payload);
+    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.json(payload);
   } catch (err) {
     console.error('[fixtures/meta]', err);
     res.status(200).json(emptyFixtureMeta());
@@ -282,6 +335,16 @@ router.get('/home', async (req: Request, res: Response) => {
       day,
       limit = '100',
     } = req.query;
+
+    const cacheKey = `home:${limit}:${day || 'all'}:${country || ''}:${api_league_id || ''}`;
+    const cached = getCachedResponse<{ fixtures: unknown[]; odds: Record<string, unknown[]> }>(
+      cacheKey
+    );
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=30');
+      res.json(cached);
+      return;
+    }
     const rawLimit = parseInt(limit as string, 10);
     const pageLimit = Number.isFinite(rawLimit)
       ? Math.min(MAX_FIXTURES_PAGE, Math.max(1, rawLimit))
@@ -347,8 +410,9 @@ router.get('/home', async (req: Request, res: Response) => {
 
     if (ids.length > 0) {
       const { rows: oddsRows } = await pool.query(
-        `SELECT DISTINCT ON (o.fixture_id, bm.id, o.selection)
-          o.*, b.name as bookmaker_name, b.logo as bookmaker_logo,
+        `SELECT DISTINCT ON (o.fixture_id, o.selection)
+          o.id, o.fixture_id, o.bookmaker_id, o.market_id, o.selection, o.odd_value, o.last_update,
+          b.name as bookmaker_name, b.logo as bookmaker_logo,
           bm.name as market_name, bm.market_key
          FROM odds o
          JOIN bookmakers b ON o.bookmaker_id = b.id
@@ -356,9 +420,10 @@ router.get('/home', async (req: Request, res: Response) => {
          WHERE o.fixture_id = ANY($1::int[])
            AND o.odd_value IS NOT NULL
            AND o.odd_value > 0
-           AND ${sqlMarketIsDisplayable('bm')}
-         ORDER BY o.fixture_id, bm.id, o.selection, o.last_update DESC NULLS LAST,
-           CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END, b.id`,
+           AND (bm.market_key = '1' OR LOWER(bm.market_key) = '1x2')
+           AND o.selection IN ('Home', 'Draw', 'Away', '1', 'X', '2')
+         ORDER BY o.fixture_id, o.selection, o.last_update DESC NULLS LAST,
+           CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END`,
         [ids]
       );
       for (const row of oddsRows) {
@@ -368,7 +433,10 @@ router.get('/home', async (req: Request, res: Response) => {
       }
     }
 
-    res.json({ fixtures, odds });
+    const payload = { fixtures, odds };
+    setCachedResponse(cacheKey, payload);
+    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.json(payload);
   } catch (err) {
     console.error('[fixtures/home]', err);
     res.status(200).json({ fixtures: [], odds: {} });
