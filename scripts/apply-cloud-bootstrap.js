@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS app_settings (
 INSERT INTO app_settings (key, value)
 VALUES ('withdrawal_min_total_deposit', '{"amount": 6665}')
 ON CONFLICT (key) DO NOTHING;
+INSERT INTO app_settings (key, value)
+VALUES ('support_telegram_username', '{"username": "@TipicoEt"}')
+ON CONFLICT (key) DO NOTHING;
 `;
 
 async function main() {

@@ -9,6 +9,10 @@ import {
   getWithdrawalMinTotalDeposit,
   setWithdrawalMinTotalDeposit,
 } from '../services/depositRule';
+import {
+  getSupportTelegramUsername,
+  setSupportTelegramUsername,
+} from '../services/supportTelegram';
 
 const router = Router();
 
@@ -740,6 +744,35 @@ router.put('/deposit-rule', verifyAdmin, async (req: Request, res: Response) => 
   } catch (err) {
     console.error('deposit-rule put error:', err);
     res.status(500).json({ message: 'Failed to save deposit rule' });
+  }
+});
+
+// Support team Telegram (public read for site FAB; admin write)
+router.get('/support-telegram', async (_req: Request, res: Response) => {
+  try {
+    const username = await getSupportTelegramUsername();
+    res.json({ username });
+  } catch (err) {
+    console.error('support-telegram get error:', err);
+    res.status(500).json({ message: 'Failed to fetch support Telegram' });
+  }
+});
+
+router.put('/support-telegram', verifyAdmin, async (req: Request, res: Response) => {
+  const raw = typeof req.body?.username === 'string' ? req.body.username : '';
+  if (!raw.trim()) {
+    return res.status(400).json({ message: 'Telegram username is required' });
+  }
+  try {
+    const username = await setSupportTelegramUsername(raw);
+    res.json({ username });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to save';
+    if (message === 'Invalid Telegram username') {
+      return res.status(400).json({ message: 'Enter a valid Telegram username (5–32 letters, numbers, or _)' });
+    }
+    console.error('support-telegram put error:', err);
+    res.status(500).json({ message: 'Failed to save support Telegram' });
   }
 });
 
