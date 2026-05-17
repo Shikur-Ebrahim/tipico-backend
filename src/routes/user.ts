@@ -40,6 +40,36 @@ router.post('/deposit-request', verifyUser, async (req: Request, res: Response) 
   }
 });
 
+const DEPOSIT_METHODS_SELECT = `
+  SELECT id, name, logo_url, min_amount, account_details, account_name
+  FROM deposit_methods
+  WHERE active = true
+  ORDER BY name ASC
+`;
+
+/** One round-trip: pending status + active deposit methods (for fast deposit modal). */
+router.get('/deposit-bootstrap', verifyUser, async (req: Request, res: Response) => {
+  const { userId } = req.body;
+
+  try {
+    const [pendingRes, methodsRes] = await Promise.all([
+      pool.query(
+        `SELECT 1 FROM deposit_requests WHERE user_id = $1 AND status = 'pending' LIMIT 1`,
+        [userId]
+      ),
+      pool.query(DEPOSIT_METHODS_SELECT),
+    ]);
+
+    res.json({
+      hasPending: pendingRes.rows.length > 0,
+      methods: methodsRes.rows,
+    });
+  } catch (err) {
+    console.error('Error in deposit-bootstrap:', err);
+    res.status(500).json({ message: 'Failed to load deposit data' });
+  }
+});
+
 // Get pending deposit request for user
 router.get('/pending-deposit', verifyUser, async (req: Request, res: Response) => {
   const { userId } = req.body;

@@ -18,6 +18,8 @@ import chatRouter from './routes/chat';
 import { ensureBetSlipSchema } from './db/ensureBetSlipSchema';
 import { ensureWithdrawalMethodsTable } from './db/ensureWithdrawalRequests';
 import { ensureAppSettings } from './db/ensureAppSettings';
+import { ensureAuthSchema } from './db/ensureAuthSchema';
+import { ensureDepositSchema } from './db/ensureDepositSchema';
 
 dotenv.config();
 
@@ -75,6 +77,9 @@ async function startServer() {
     await ensureBetSlipSchema();
     await ensureWithdrawalMethodsTable();
     await ensureAppSettings();
+    await ensureAuthSchema();
+    await ensureDepositSchema();
+    void pool.query('SELECT 1').catch(() => undefined);
     console.log('[DB] schema ready');
   } catch (e) {
     console.error('[DB] startup schema ensure failed:', e);

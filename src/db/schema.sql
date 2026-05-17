@@ -360,6 +360,8 @@ CREATE INDEX IF NOT EXISTS idx_fixtures_api ON fixtures(api_fixture_id);
 CREATE INDEX IF NOT EXISTS idx_odds_fixture ON odds(fixture_id);
 CREATE INDEX IF NOT EXISTS idx_live_matches_active ON live_matches(is_active);
 CREATE INDEX IF NOT EXISTS idx_bet_slips_user ON bet_slips(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone);
+CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
 CREATE INDEX IF NOT EXISTS idx_standings_league ON standings(league_id);
 CREATE INDEX IF NOT EXISTS idx_teams_api ON teams(api_team_id);
 CREATE INDEX IF NOT EXISTS idx_leagues_api ON leagues(api_league_id);
