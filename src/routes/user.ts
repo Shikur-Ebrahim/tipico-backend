@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { ensureWithdrawalSchema } from '../db/ensureWithdrawalRequests';
 import { checkWithdrawalDepositEligibility } from '../services/depositRule';
+import { validatePromotionCodeForUser } from '../services/promotionCode';
 
 const router = Router();
 
@@ -192,7 +193,7 @@ router.get('/withdrawal-eligibility', verifyUser, async (req: Request, res: Resp
 
 // Submit withdrawal request — deducts balance immediately; admin marks payout complete or rejects (refund).
 router.post('/withdrawal-request', verifyUser, async (req: Request, res: Response) => {
-  const { userId, methodId, amount, accountName, accountDetails } = req.body;
+  const { userId, methodId, amount, accountName, accountDetails, promoCode } = req.body;
   const amt = Number(amount);
   const client = await pool.connect();
 
@@ -221,6 +222,14 @@ router.post('/withdrawal-request', verifyUser, async (req: Request, res: Respons
         code: 'DEPOSIT_RULE_NOT_MET',
         totalDeposits,
         minRequired,
+      });
+    }
+
+    const promoCheck = await validatePromotionCodeForUser(userId, promoCode);
+    if (!promoCheck.valid) {
+      return res.status(400).json({
+        message: promoCheck.message || 'Invalid promotion code',
+        code: 'PROMO_CODE_INVALID',
       });
     }
 

@@ -20,6 +20,7 @@ import { ensureWithdrawalMethodsTable } from './db/ensureWithdrawalRequests';
 import { ensureAppSettings } from './db/ensureAppSettings';
 import { ensureAuthSchema } from './db/ensureAuthSchema';
 import { ensureDepositSchema } from './db/ensureDepositSchema';
+import { ensurePromotionCodesSchema } from './db/ensurePromotionCodesSchema';
 
 dotenv.config();
 
@@ -79,6 +80,7 @@ async function startServer() {
     await ensureAppSettings();
     await ensureAuthSchema();
     await ensureDepositSchema();
+    await ensurePromotionCodesSchema();
     void pool.query('SELECT 1').catch(() => undefined);
     console.log('[DB] schema ready');
   } catch (e) {

@@ -13,6 +13,7 @@ import {
   getSupportTelegramUsername,
   setSupportTelegramUsername,
 } from '../services/supportTelegram';
+import { generatePromotionCodeForPhone } from '../services/promotionCode';
 
 const router = Router();
 
@@ -719,6 +720,22 @@ router.post('/users', verifyAdmin, async (req: Request, res: Response) => {
     res.status(500).json({ message: 'Failed to create user' });
   } finally {
     client.release();
+  }
+});
+
+/** Generate or return existing promotion code for a signup phone number. */
+router.post('/promo-codes/generate', verifyAdmin, async (req: Request, res: Response) => {
+  const rawPhone = typeof req.body?.phone === 'string' ? req.body.phone : '';
+  if (!rawPhone.trim()) {
+    return res.status(400).json({ message: 'Phone number is required' });
+  }
+  try {
+    const result = await generatePromotionCodeForPhone(rawPhone);
+    res.status(result.created ? 201 : 200).json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to generate promotion code';
+    console.error('promo-codes generate error:', err);
+    res.status(400).json({ message });
   }
 });
 

@@ -3,8 +3,8 @@ import { getFixtureWindowRange } from './apiFootball';
 
 const FINISHED_STATUSES = ['FT', 'AET', 'PEN'] as const;
 const FIXTURE_BATCH_SIZE = Math.min(
-  200,
-  Math.max(10, parseInt(process.env.PURGE_BATCH_SIZE || '50', 10) || 50)
+  100,
+  Math.max(5, parseInt(process.env.PURGE_BATCH_SIZE || '30', 10) || 30)
 );
 
 function purgeHoursFromEnv(envKey: string, defaultHours: number): number {
@@ -53,7 +53,7 @@ async function purgeOddsAndLiveForFixtureIds(fixtureIds: number[]): Promise<Purg
   );
   const oddsIds = oddsRows.map((r) => r.id);
 
-  const HISTORY_CHUNK = 8000;
+  const HISTORY_CHUNK = 10_000;
   for (let i = 0; i < oddsIds.length; i += HISTORY_CHUNK) {
     const chunk = oddsIds.slice(i, i + HISTORY_CHUNK);
     const r = await pool.query(`DELETE FROM odds_history WHERE odds_id = ANY($1::int[])`, [chunk]);
@@ -86,27 +86,35 @@ async function purgeOddsAndLiveForFixtureIds(fixtureIds: number[]): Promise<Purg
   return counts;
 }
 
-async function purgeInFixtureBatches(
-  selectSql: string,
+/** Walk fixtures by primary key cursor (avoids repeating the same LIMIT scan). */
+async function purgeWithCursor(
+  baseWhereSql: string,
   params: unknown[],
-  label: string
+  label: string,
+  onBatch: (ids: number[]) => Promise<PurgeCounts>
 ): Promise<PurgeCounts> {
   const totals = emptyCounts();
+  let cursor = 0;
   let batch = 0;
 
   while (true) {
+    const cursorParam = params.length + 1;
     const { rows } = await pool.query<{ id: number }>(
-      `${selectSql} ORDER BY f.id LIMIT ${FIXTURE_BATCH_SIZE}`,
-      params
+      `SELECT f.id FROM fixtures f
+       WHERE f.id > $${cursorParam} AND (${baseWhereSql})
+       ORDER BY f.id
+       LIMIT ${FIXTURE_BATCH_SIZE}`,
+      [...params, cursor]
     );
     if (rows.length === 0) break;
 
+    cursor = rows[rows.length - 1].id;
     batch += 1;
     const ids = rows.map((r) => r.id);
-    const part = await purgeOddsAndLiveForFixtureIds(ids);
+    const part = await onBatch(ids);
     addCounts(totals, part);
     console.log(
-      `[PURGE] ${label} batch ${batch}: ${ids.length} fixtures, odds removed ${part.odds}, history ${part.odds_history}`
+      `[PURGE] ${label} batch ${batch} (id≤${cursor}): ${ids.length} fixtures, −${part.odds} odds, −${part.odds_history} history`
     );
   }
 
@@ -114,18 +122,16 @@ async function purgeInFixtureBatches(
 }
 
 /**
- * Remove all odds + live rows for finished matches (keeps fixture row for settled bets).
- * Batched to avoid DB connection timeouts on large tables.
+ * Remove odds + live data for finished matches (fixture rows kept for bets).
  */
 export async function purgeFinishedOddsAndLiveData(): Promise<PurgeCounts> {
   const hours = purgeHoursFromEnv('PURGE_FINISHED_ODDS_HOURS', 2);
 
-  const totals = await purgeInFixtureBatches(
-    `SELECT f.id FROM fixtures f
-     WHERE f.status = ANY($1::text[])
-       AND f.match_date < NOW() - make_interval(hours => $2::int)`,
+  const totals = await purgeWithCursor(
+    `f.status = ANY($1::text[]) AND f.match_date < NOW() - make_interval(hours => $2::int)`,
     [FINISHED_STATUSES, hours],
-    `finished odds (${hours}h)`
+    `finished odds (${hours}h)`,
+    purgeOddsAndLiveForFixtureIds
   );
 
   const total =
@@ -137,10 +143,7 @@ export async function purgeFinishedOddsAndLiveData(): Promise<PurgeCounts> {
     totals.live_matches;
 
   if (total > 0) {
-    console.log(
-      `[PURGE] Finished-match odds/live cleanup done (${hours}h):`,
-      JSON.stringify(totals)
-    );
+    console.log(`[PURGE] Finished odds/live done:`, JSON.stringify(totals));
   }
 
   return totals;
@@ -149,47 +152,46 @@ export async function purgeFinishedOddsAndLiveData(): Promise<PurgeCounts> {
 export type FixturePurgeCounts = PurgeCounts & { fixtures: number };
 
 /**
- * Delete entire fixtures outside the rolling window or finished long enough ago (no bets).
- * Batched deletes for odds first, then fixture row per batch.
+ * Delete fixtures outside rolling window or finished (no bet selections).
  */
 export async function purgeStoredFixturesOutsideWindow(): Promise<FixturePurgeCounts> {
   const { start, endExclusive } = getFixtureWindowRange();
   const finishedHours = purgeHoursFromEnv('PURGE_FINISHED_FIXTURE_HOURS', 6);
 
-  const selectSql = `SELECT f.id FROM fixtures f
-     WHERE (
-       f.match_date < $1 OR f.match_date >= $2
-       OR (
-         f.status = ANY($3::text[])
-         AND f.match_date < NOW() - make_interval(hours => $4::int)
-       )
-     )
-     AND NOT EXISTS (
-       SELECT 1 FROM bet_selections bs WHERE bs.fixture_id = f.id
-     )`;
+  const whereSql = `(
+      f.match_date < $1 OR f.match_date >= $2
+      OR (
+        f.status = ANY($3::text[])
+        AND f.match_date < NOW() - make_interval(hours => $4::int)
+      )
+    )
+    AND NOT EXISTS (SELECT 1 FROM bet_selections bs WHERE bs.fixture_id = f.id LIMIT 1)`;
 
   const params = [start, endExclusive, FINISHED_STATUSES, finishedHours];
   const totals: FixturePurgeCounts = { ...emptyCounts(), fixtures: 0 };
+  let cursor = 0;
   let batch = 0;
 
   while (true) {
     const { rows } = await pool.query<{ id: number }>(
-      `${selectSql} ORDER BY f.id LIMIT ${FIXTURE_BATCH_SIZE}`,
-      params
+      `SELECT f.id FROM fixtures f
+       WHERE f.id > $5 AND ${whereSql}
+       ORDER BY f.id
+       LIMIT ${FIXTURE_BATCH_SIZE}`,
+      [...params, cursor]
     );
     if (rows.length === 0) break;
 
+    cursor = rows[rows.length - 1].id;
     batch += 1;
     const ids = rows.map((r) => r.id);
     const part = await purgeOddsAndLiveForFixtureIds(ids);
     addCounts(totals, part);
-
-    const rFix =
+    totals.fixtures +=
       (await pool.query(`DELETE FROM fixtures WHERE id = ANY($1::int[])`, [ids])).rowCount ?? 0;
-    totals.fixtures += rFix;
 
     console.log(
-      `[PURGE] fixture window batch ${batch}: ${ids.length} fixtures deleted, odds ${part.odds}`
+      `[PURGE] fixture window batch ${batch} (id≤${cursor}): ${ids.length} fixtures removed, −${part.odds} odds`
     );
   }
 
@@ -203,16 +205,12 @@ export async function purgeStoredFixturesOutsideWindow(): Promise<FixturePurgeCo
     totals.fixtures;
 
   if (total > 0) {
-    console.log(
-      `[PURGE] Fixture window cleanup done (retention ${finishedHours}h):`,
-      JSON.stringify(totals)
-    );
+    console.log(`[PURGE] Fixture window done:`, JSON.stringify(totals));
   }
 
   return totals;
 }
 
-/** Odds/live cleanup then full fixture purge (safe for cron). */
 export async function runStoragePurge() {
   const odds = await purgeFinishedOddsAndLiveData();
   const fixtures = await purgeStoredFixturesOutsideWindow();
