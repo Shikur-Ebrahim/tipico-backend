@@ -3,6 +3,7 @@ import pool from '../config/database';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { ensureWithdrawalSchema } from '../db/ensureWithdrawalRequests';
+import { checkWithdrawalDepositEligibility } from '../services/depositRule';
 
 const router = Router();
 
@@ -147,6 +148,18 @@ router.get('/withdrawal-history', verifyUser, async (req: Request, res: Response
   }
 });
 
+// Check if user meets minimum total approved deposit for withdrawals
+router.get('/withdrawal-eligibility', verifyUser, async (req: Request, res: Response) => {
+  const userId = req.body.userId;
+  try {
+    const eligibility = await checkWithdrawalDepositEligibility(userId);
+    res.json(eligibility);
+  } catch (err) {
+    console.error('withdrawal-eligibility error:', err);
+    res.status(500).json({ message: 'Failed to check withdrawal eligibility' });
+  }
+});
+
 // Submit withdrawal request — deducts balance immediately; admin marks payout complete or rejects (refund).
 router.post('/withdrawal-request', verifyUser, async (req: Request, res: Response) => {
   const { userId, methodId, amount, accountName, accountDetails } = req.body;
@@ -169,6 +182,16 @@ router.post('/withdrawal-request', verifyUser, async (req: Request, res: Respons
     );
     if (pendingCheck.rows.length > 0) {
       return res.status(400).json({ message: 'You already have a withdrawal in processing. Wait for it to complete.' });
+    }
+
+    const { eligible, totalDeposits, minRequired } = await checkWithdrawalDepositEligibility(userId);
+    if (!eligible) {
+      return res.status(400).json({
+        message: `To withdraw in Tipico betting, your total approved deposits must reach ${minRequired} ETB. You have deposited ${totalDeposits.toFixed(2)} ETB so far.`,
+        code: 'DEPOSIT_RULE_NOT_MET',
+        totalDeposits,
+        minRequired,
+      });
     }
 
     await client.query('BEGIN');

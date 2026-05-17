@@ -170,6 +170,62 @@ router.get('/ticket-code/:code', async (req: Request, res: Response) => {
   }
 });
 
+/** Public: view a placed ticket (stake, status, leg results) — no login. */
+router.get('/ticket-check/:code', async (req: Request, res: Response) => {
+  const rawParam = req.params.code;
+  const codeParam = Array.isArray(rawParam) ? rawParam[0] : rawParam;
+  const code = normalizeTicketCodeParam(codeParam || '');
+  if (!code) {
+    res.status(400).json({ message: 'Enter a ticket code' });
+    return;
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT bs.id,
+        bs.ticket_code,
+        bs.stake,
+        bs.total_odds,
+        bs.possible_win,
+        bs.status,
+        bs.created_at,
+        COALESCE(json_agg(
+          json_build_object(
+            'fixture_id', bsel.fixture_id,
+            'selection', bsel.selection,
+            'odd', bsel.odd,
+            'result', bsel.result,
+            'home_team', bsel.home_team,
+            'away_team', bsel.away_team,
+            'home_logo', bsel.home_logo,
+            'away_logo', bsel.away_logo,
+            'league_name', bsel.league_name,
+            'market_name', bsel.market_name,
+            'kickoff_at', COALESCE(bsel.manual_kickoff_at, f.match_date)
+          )
+          ORDER BY bsel.id
+        ) FILTER (WHERE bsel.id IS NOT NULL), '[]') AS selections
+       FROM bet_slips bs
+       LEFT JOIN bet_selections bsel ON bs.id = bsel.bet_slip_id
+       LEFT JOIN fixtures f ON f.id = bsel.fixture_id
+       WHERE bs.ticket_code IS NOT NULL
+         AND UPPER(TRIM(bs.ticket_code)) = $1
+       GROUP BY bs.id`,
+      [code]
+    );
+
+    if (rows.length === 0) {
+      res.status(404).json({ message: 'No ticket found for this code' });
+      return;
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Ticket check error:', err);
+    res.status(500).json({ message: 'Failed to look up ticket' });
+  }
+});
+
 // Place bet
 router.post('/bet', async (req: Request, res: Response) => {
   const { user_id, selections, stake, enforce_prematch_from_ticket: enforcePrematchRaw } = req.body;

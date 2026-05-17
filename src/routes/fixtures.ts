@@ -2,16 +2,31 @@ import { Router, Request, Response } from 'express';
 import pool from '../config/database';
 
 import { getFixtureWindowRange } from '../services/apiFootball';
-import { runBootstrapSync } from '../services/syncService';
+import { runBootstrapSync, runOddsSync } from '../services/syncService';
+import { sqlFixtureHasDisplayableOdds } from '../utils/displayableOdds';
+import { buildRollingDayIds, getDayRangeFromId } from '../utils/fixtureDayFilter';
 
 const router = Router();
 
-const MAX_FIXTURES_PAGE = 3000;
+const MAX_FIXTURES_PAGE = 5000;
 
 /** Cooldown between background bootstraps triggered by empty fixture list (ms). */
 const BOOTSTRAP_ON_EMPTY_COOLDOWN_MS = 90 * 60 * 1000;
 
 let lastBootstrapOnEmptyAt = 0;
+let lastOddsBackfillAt = 0;
+const ODDS_BACKFILL_COOLDOWN_MS = 5 * 60 * 1000;
+
+function maybeTriggerOddsBackfill(): void {
+  const v = process.env.AUTO_ODDS_BACKFILL_ON_LIST;
+  if (v === '0' || v === 'false' || v === 'no') return;
+  const now = Date.now();
+  if (now - lastOddsBackfillAt < ODDS_BACKFILL_COOLDOWN_MS) return;
+  lastOddsBackfillAt = now;
+  void runOddsSync(200).catch((err) =>
+    console.error('[fixtures] background odds backfill failed:', err)
+  );
+}
 
 /** Default ON: kick a background API sync when /fixtures returns no rows in the rolling window. Set BOOTSTRAP_ON_EMPTY_FIXTURES=0 to disable. */
 function autoBootstrapOnEmptyListEnabled(): boolean {
@@ -38,9 +53,9 @@ function maybeTriggerBootstrapOnEmpty(params: {
   if (now - lastBootstrapOnEmptyAt < BOOTSTRAP_ON_EMPTY_COOLDOWN_MS) return;
   lastBootstrapOnEmptyAt = now;
 
-  void runBootstrapSync().catch((err) =>
-    console.error('[fixtures] BOOTSTRAP_ON_EMPTY background sync failed:', err)
-  );
+  void runBootstrapSync()
+    .then(() => runOddsSync(200))
+    .catch((err) => console.error('[fixtures] BOOTSTRAP_ON_EMPTY background sync failed:', err));
 }
 
 /** List up to MAX rows without rolling date window (after bulk migrate / large DB). Set on Render if needed. */
@@ -49,9 +64,100 @@ function listAllFixturesInDb(): boolean {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
+router.get('/meta', async (req: Request, res: Response) => {
+  try {
+    const onlyWithOdds =
+      req.query.has_odds === '1' ||
+      req.query.has_odds === 'true' ||
+      req.query.has_odds === 'yes';
+    const countryDay = typeof req.query.day === 'string' ? req.query.day : 'all';
+    const { start: windowStart, endExclusive: windowEnd } = getFixtureWindowRange();
+
+    const baseWhere = `
+      FROM fixtures f
+      JOIN leagues l ON f.league_id = l.id
+      LEFT JOIN countries c ON l.country_id = c.id
+      WHERE f.match_date >= $1 AND f.match_date < $2
+        AND (f.status <> 'FT' OR f.match_date > NOW() - INTERVAL '2 hours')
+        ${onlyWithOdds ? `AND ${sqlFixtureHasDisplayableOdds('f')}` : ''}
+    `;
+    const baseParams: (string | number | Date)[] = [windowStart, windowEnd];
+
+    const { rows: totalRows } = await pool.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n ${baseWhere}`,
+      baseParams
+    );
+    const total = totalRows[0]?.n ?? 0;
+
+    const days: { id: string; count: number }[] = [];
+    for (const dayId of buildRollingDayIds()) {
+      if (dayId === 'all') {
+        days.push({ id: 'all', count: total });
+        continue;
+      }
+      const range = getDayRangeFromId(dayId);
+      if (!range) continue;
+      const { rows } = await pool.query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n ${baseWhere}
+         AND f.match_date >= $3 AND f.match_date < $4`,
+        [...baseParams, range.start, range.endExclusive]
+      );
+      days.push({ id: dayId, count: rows[0]?.n ?? 0 });
+    }
+
+    let countrySql = `SELECT COALESCE(c.name, 'International') AS name,
+        MAX(c.flag_url) AS flag_url,
+        COUNT(*)::int AS count
+      ${baseWhere}`;
+    const countryParams = [...baseParams];
+    const dayRange = getDayRangeFromId(countryDay);
+    if (dayRange) {
+      countrySql += ` AND f.match_date >= $${countryParams.length + 1} AND f.match_date < $${countryParams.length + 2}`;
+      countryParams.push(dayRange.start, dayRange.endExclusive);
+    }
+    countrySql += ` GROUP BY COALESCE(c.name, 'International') ORDER BY name ASC`;
+
+    const { rows: countryRows } = await pool.query<{
+      name: string;
+      flag_url: string | null;
+      count: number;
+    }>(countrySql, countryParams);
+
+    const countryTotal = countryRows.reduce((sum, row) => sum + row.count, 0);
+
+    res.json({
+      total,
+      days,
+      countries: [
+        { name: 'All countries', count: countryTotal, flag_url: null },
+        ...countryRows.map((r) => ({
+          name: r.name,
+          count: r.count,
+          flag_url: r.flag_url,
+        })),
+      ],
+    });
+  } catch (err) {
+    console.error('[fixtures/meta]', err);
+    res.status(500).json({ error: 'Failed to fetch fixture meta' });
+  }
+});
+
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const { league_id, status, date, page = '1', limit = '20' } = req.query;
+    const {
+      league_id,
+      api_league_id,
+      country,
+      day,
+      status,
+      date,
+      page = '1',
+      limit = '20',
+      has_odds,
+    } = req.query;
+    const onlyWithOdds =
+      has_odds === '1' || has_odds === 'true' || has_odds === 'yes';
     const rawLimit = parseInt(limit as string, 10);
     const pageLimit = Number.isFinite(rawLimit)
       ? Math.min(MAX_FIXTURES_PAGE, Math.max(1, rawLimit))
@@ -82,9 +188,31 @@ router.get('/', async (req: Request, res: Response) => {
       query += ` AND f.league_id = $${paramIndex++}`;
       params.push(parseInt(league_id as string, 10));
     }
+    if (api_league_id) {
+      query += ` AND l.api_league_id = $${paramIndex++}`;
+      params.push(parseInt(api_league_id as string, 10));
+    }
+    if (country && country !== 'All countries') {
+      if (country === 'International') {
+        query += ` AND c.name IS NULL`;
+      } else {
+        query += ` AND c.name = $${paramIndex++}`;
+        params.push(country as string);
+      }
+    }
+    if (typeof day === 'string' && day !== 'all') {
+      const range = getDayRangeFromId(day);
+      if (range) {
+        query += ` AND f.match_date >= $${paramIndex++} AND f.match_date < $${paramIndex++}`;
+        params.push(range.start, range.endExclusive);
+      }
+    }
     if (status) {
       query += ` AND f.status = $${paramIndex++}`;
       params.push(status as string);
+    }
+    if (onlyWithOdds) {
+      query += ` AND ${sqlFixtureHasDisplayableOdds('f')}`;
     }
     if (date) {
       query += ` AND DATE(f.match_date) = $${paramIndex++}`;
@@ -114,6 +242,9 @@ router.get('/', async (req: Request, res: Response) => {
     params.push(pageLimit, offset);
 
     const { rows } = await pool.query(query, params);
+    if (onlyWithOdds && rows.length > 0) {
+      maybeTriggerOddsBackfill();
+    }
     maybeTriggerBootstrapOnEmpty({
       rowCount: rows.length,
       pageNum,

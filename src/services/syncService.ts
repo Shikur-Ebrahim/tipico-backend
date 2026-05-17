@@ -11,9 +11,12 @@ import {
   getFixtureWindowRange,
   fetchAndStoreFixturesForRollingWindow,
   fetchAndStoreBulkOddsForRollingWindowByDate,
+  fetchAndStoreLeaguesByIds,
+  fetchAndStoreFixtures,
 } from './apiFootball';
 import { settlePendingBetSlips } from './betSettlementService';
 import pool, { verifyDatabaseConnection } from '../config/database';
+import { sqlFixtureHasDisplayableOdds } from '../utils/displayableOdds';
 
 export const TOP_LEAGUES = [
   39,  // English Premier League
@@ -48,6 +51,16 @@ const ODDS_FETCH_CONCURRENCY = Math.min(
 let fullSyncRunning = false;
 let liveSyncRunning = false;
 let oddsSyncRunning = false;
+let rollingFillRunning = false;
+
+const ROLLING_FILL_TARGET = Math.min(
+  5000,
+  Math.max(50, parseInt(process.env.SYNC_WEEK_TARGET_FIXTURES || '5000', 10) || 5000)
+);
+const ROLLING_FILL_ODDS_PASSES = Math.min(
+  120,
+  Math.max(5, parseInt(process.env.SYNC_FILL_ODDS_PASSES || '40', 10) || 40)
+);
 
 type SyncedLeagueRow = {
   api_league_id: number;
@@ -136,6 +149,78 @@ export async function runLiveSync() {
   }
 }
 
+async function countWindowFixturesWithOdds(): Promise<{ total: number; withOdds: number }> {
+  const { start, endExclusive } = getFixtureWindowRange();
+  const displayableSql = sqlFixtureHasDisplayableOdds('f');
+  const { rows } = await pool.query<{ n: number; with_odds: number }>(
+    `SELECT
+       COUNT(*)::int AS n,
+       COUNT(*) FILTER (WHERE ${displayableSql})::int AS with_odds
+     FROM fixtures f
+     WHERE f.match_date >= $1 AND f.match_date < $2`,
+    [start, endExclusive]
+  );
+  return { total: rows[0]?.n ?? 0, withOdds: rows[0]?.with_odds ?? 0 };
+}
+
+/** Fill odds in the 7-day window until SYNC_WEEK_TARGET_FIXTURES (default 5000) have displayable odds. */
+export async function runRollingOddsFill() {
+  if (rollingFillRunning) {
+    return { started: false, reason: 'Rolling odds fill already running' };
+  }
+  rollingFillRunning = true;
+  const batch = Math.min(400, ODDS_SYNC_BATCH);
+  let stagnant = 0;
+
+  try {
+    console.log(
+      `[SYNC] Rolling odds fill started (target ${ROLLING_FILL_TARGET} with odds, up to ${ROLLING_FILL_ODDS_PASSES} passes)`
+    );
+
+    for (let pass = 0; pass < ROLLING_FILL_ODDS_PASSES; pass++) {
+      const before = await countWindowFixturesWithOdds();
+      if (before.withOdds >= ROLLING_FILL_TARGET) {
+        console.log(`[SYNC] Rolling fill target reached: ${before.withOdds} fixtures with odds`);
+        return { started: true, completed: true, withOdds: before.withOdds };
+      }
+      if (before.total > 0 && before.withOdds >= before.total) {
+        console.log(`[SYNC] All ${before.total} window fixtures already have odds`);
+        return { started: true, completed: true, withOdds: before.withOdds };
+      }
+
+      const r = await runOddsSync(batch);
+      if (!('started' in r) || r.started === false) {
+        console.log(`[SYNC] Rolling fill stopped: ${JSON.stringify(r)}`);
+        break;
+      }
+
+      const after = await countWindowFixturesWithOdds();
+      console.log(
+        `[SYNC] Rolling fill pass ${pass + 1}/${ROLLING_FILL_ODDS_PASSES}: ${after.withOdds}/${after.total} with odds`
+      );
+
+      if (after.withOdds >= ROLLING_FILL_TARGET) {
+        return { started: true, completed: true, withOdds: after.withOdds };
+      }
+
+      if (before.withOdds === after.withOdds) {
+        stagnant += 1;
+        if (stagnant >= 8) {
+          console.log('[SYNC] Rolling fill: no progress for 8 passes; stopping');
+          break;
+        }
+      } else {
+        stagnant = 0;
+      }
+    }
+
+    const final = await countWindowFixturesWithOdds();
+    return { started: true, completed: true, withOdds: final.withOdds };
+  } finally {
+    rollingFillRunning = false;
+  }
+}
+
 export async function runOddsSync(limit = ODDS_SYNC_BATCH) {
   if (oddsSyncRunning) {
     return { started: false, reason: 'Odds sync already running' };
@@ -147,6 +232,7 @@ export async function runOddsSync(limit = ODDS_SYNC_BATCH) {
     const { start, endExclusive } = getFixtureWindowRange();
     const batch = Math.min(400, Math.max(1, limit));
 
+    const displayableSql = sqlFixtureHasDisplayableOdds('f');
     const fixtures = await pool.query(
       `SELECT f.api_fixture_id 
        FROM fixtures f
@@ -158,19 +244,18 @@ export async function runOddsSync(limit = ODDS_SYNC_BATCH) {
        GROUP BY f.id, f.api_fixture_id, f.match_date, f.status, l.is_top
        ORDER BY 
          (CASE
-           -- In-play: refresh odds often (DB → frontend polling reads this)
+           WHEN NOT (${displayableSql}) THEN 0
            WHEN f.status IN ('1H', '2H', 'HT', 'LIVE', 'ET', 'P')
                 AND (MAX(o.last_update) IS NULL OR MAX(o.last_update) < NOW() - INTERVAL '30 seconds')
-             THEN 0
-           -- Just finished: markets settle / suspend — pull again soon
+             THEN 1
            WHEN f.status IN ('FT', 'AET', 'PEN')
                 AND f.match_date > NOW() - INTERVAL '3 hours'
                 AND (MAX(o.last_update) IS NULL OR MAX(o.last_update) < NOW() - INTERVAL '20 seconds')
-             THEN 1
-           WHEN f.status IN ('1H', '2H', 'HT', 'LIVE', 'ET', 'P') THEN 2
-           WHEN MAX(o.id) IS NULL THEN 3
-           WHEN f.status = 'NS' THEN 4
-           ELSE 5
+             THEN 2
+           WHEN f.status IN ('1H', '2H', 'HT', 'LIVE', 'ET', 'P') THEN 3
+           WHEN MAX(o.id) IS NULL THEN 4
+           WHEN f.status = 'NS' THEN 5
+           ELSE 6
          END) ASC,
          l.is_top DESC NULLS LAST,
          MAX(o.last_update) NULLS FIRST,
@@ -232,6 +317,19 @@ function isDatabaseConnectivityError(err: unknown): boolean {
   );
 }
 
+function shouldRunBootstrapOnStart(): boolean {
+  const v = process.env.RUN_BOOTSTRAP_ON_START;
+  if (v === '0' || v === 'false' || v === 'no') return false;
+  /** Default on: 7-day fixtures + odds fill on startup (set RUN_BOOTSTRAP_ON_START=0 to disable). */
+  return true;
+}
+
+function shouldRunRollingFillOnStart(): boolean {
+  const v = process.env.RUN_ROLLING_FILL_ON_START;
+  if (v === '0' || v === 'false' || v === 'no') return false;
+  return true;
+}
+
 export function startSyncJobs() {
   void (async () => {
     try {
@@ -249,14 +347,28 @@ export function startSyncJobs() {
       return;
     }
 
-    try {
-      await runBootstrapSync();
-    } catch (err) {
-      if (isDatabaseConnectivityError(err)) {
-        console.error('[SYNC] Initial bootstrap failed: lost database connection during sync.');
-        console.error('[SYNC]', err instanceof Error ? err.message : err);
-      } else {
-        console.error('[SYNC] Initial bootstrap error:', err);
+    if (shouldRunBootstrapOnStart()) {
+      try {
+        await runBootstrapSync();
+        if (shouldRunRollingFillOnStart()) {
+          void runRollingOddsFill().catch((err) =>
+            console.error('[SYNC] Post-bootstrap rolling odds fill error:', err)
+          );
+        }
+      } catch (err) {
+        if (isDatabaseConnectivityError(err)) {
+          console.error('[SYNC] Initial bootstrap failed: lost database connection during sync.');
+          console.error('[SYNC]', err instanceof Error ? err.message : err);
+        } else {
+          console.error('[SYNC] Initial bootstrap error:', err);
+        }
+      }
+    } else {
+      console.log('[SYNC] Skipping startup bootstrap (RUN_BOOTSTRAP_ON_START=0).');
+      if (shouldRunRollingFillOnStart()) {
+        void runRollingOddsFill().catch((err) =>
+          console.error('[SYNC] Startup rolling odds fill error:', err)
+        );
       }
     }
   })();
@@ -264,8 +376,18 @@ export function startSyncJobs() {
   cron.schedule('0 3 * * *', async () => {
     try {
       await runBootstrapSync();
+      await runRollingOddsFill();
     } catch (err) {
       console.error('[SYNC] Error:', err);
+    }
+  });
+
+  // Top up odds for fixtures missing displayable 1X2 in the 7-day window (toward 5000 cap).
+  cron.schedule('0 */4 * * *', async () => {
+    try {
+      await runRollingOddsFill();
+    } catch (err) {
+      console.error('[SYNC] Rolling odds fill error:', err);
     }
   });
 

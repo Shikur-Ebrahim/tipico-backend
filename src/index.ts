@@ -16,11 +16,13 @@ import userRouter from './routes/user';
 
 import { ensureManualPresetSchema } from './db/ensureManualPresetSchema';
 import { ensureWithdrawalMethodsTable } from './db/ensureWithdrawalRequests';
+import { ensureAppSettings } from './db/ensureAppSettings';
 
 dotenv.config();
 
 void ensureManualPresetSchema().catch((e) => console.error('[DB] ensureManualPresetSchema:', e));
 void ensureWithdrawalMethodsTable().catch((e) => console.error('[DB] ensureWithdrawalMethodsTable:', e));
+void ensureAppSettings().catch((e) => console.error('[DB] ensureAppSettings:', e));
 
 const app = express();
 const PORT = process.env.PORT || 4000;

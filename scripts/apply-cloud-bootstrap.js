@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS withdrawal_requests (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_bet_slips_ticket_code ON bet_slips(ticket_code) WHERE ticket_code IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key VARCHAR(100) PRIMARY KEY,
+  value JSONB NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+INSERT INTO app_settings (key, value)
+VALUES ('withdrawal_min_total_deposit', '{"amount": 6665}')
+ON CONFLICT (key) DO NOTHING;
 `;
 
 async function main() {

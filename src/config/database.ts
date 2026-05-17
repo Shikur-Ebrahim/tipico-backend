@@ -9,8 +9,13 @@ const connectionTimeoutMillis = parseInt(
   10
 );
 
+const poolMax = Math.min(
+  20,
+  Math.max(2, parseInt(process.env.DB_POOL_MAX || (process.env.NODE_ENV === 'production' ? '8' : '20'), 10) || 8)
+);
+
 const basePoolConfig = {
-  max: 20,
+  max: poolMax,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: Number.isFinite(connectionTimeoutMillis)
     ? connectionTimeoutMillis

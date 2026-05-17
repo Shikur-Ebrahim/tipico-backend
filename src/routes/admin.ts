@@ -5,6 +5,10 @@ import jwt from 'jsonwebtoken';
 import { ensureWithdrawalMethodsTable, ensureWithdrawalSchema } from '../db/ensureWithdrawalRequests';
 import { ensureManualPresetSchema } from '../db/ensureManualPresetSchema';
 import { allocateUniqueTicketCode } from '../utils/ticketCode';
+import {
+  getWithdrawalMinTotalDeposit,
+  setWithdrawalMinTotalDeposit,
+} from '../services/depositRule';
 
 const router = Router();
 
@@ -711,6 +715,31 @@ router.post('/users', verifyAdmin, async (req: Request, res: Response) => {
     res.status(500).json({ message: 'Failed to create user' });
   } finally {
     client.release();
+  }
+});
+
+// Get / set minimum total approved deposits required before withdrawal
+router.get('/deposit-rule', verifyAdmin, async (_req: Request, res: Response) => {
+  try {
+    const minTotalDeposit = await getWithdrawalMinTotalDeposit();
+    res.json({ minTotalDeposit });
+  } catch (err) {
+    console.error('deposit-rule get error:', err);
+    res.status(500).json({ message: 'Failed to fetch deposit rule' });
+  }
+});
+
+router.put('/deposit-rule', verifyAdmin, async (req: Request, res: Response) => {
+  const amount = Number(req.body?.minTotalDeposit);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ message: 'Valid minTotalDeposit greater than 0 is required' });
+  }
+  try {
+    const minTotalDeposit = await setWithdrawalMinTotalDeposit(amount);
+    res.json({ minTotalDeposit });
+  } catch (err) {
+    console.error('deposit-rule put error:', err);
+    res.status(500).json({ message: 'Failed to save deposit rule' });
   }
 });
 

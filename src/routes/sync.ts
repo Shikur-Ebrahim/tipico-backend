@@ -4,6 +4,7 @@ import {
   runBootstrapSync,
   runLiveSync,
   runOddsSync,
+  runRollingOddsFill,
   ODDS_SYNC_BATCH,
 } from '../services/syncService';
 
@@ -21,9 +22,21 @@ router.get('/status', async (_req: Request, res: Response) => {
 router.post('/bootstrap', async (_req: Request, res: Response) => {
   try {
     const result = await runBootstrapSync();
+    void runRollingOddsFill().catch((err) =>
+      console.error('[sync] post-bootstrap rolling fill:', err)
+    );
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Bootstrap sync failed' });
+  }
+});
+
+router.post('/fill-odds', async (_req: Request, res: Response) => {
+  try {
+    const result = await runRollingOddsFill();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Rolling odds fill failed' });
   }
 });
 
