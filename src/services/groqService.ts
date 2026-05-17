@@ -3,7 +3,6 @@
  */
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = 'llama3-8b-8192';
 
 export const SUPPORT_SYSTEM_PROMPT = `You are a professional football betting website support assistant.
 
@@ -21,12 +20,30 @@ export type ChatTurn = {
   content: string;
 };
 
-export async function getGroqChatReply(history: ChatTurn[]): Promise<string> {
-  const apiKey = process.env.GROQ_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error('GROQ_API_KEY is not configured on the server');
-  }
+function resolveModels(): string[] {
+  const preferred = process.env.GROQ_MODEL?.trim();
+  const chain = [preferred, 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile'].filter(
+    (m): m is string => Boolean(m)
+  );
+  return [...new Set(chain)];
+}
 
+function isRetryableModelError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('decommissioned') ||
+    lower.includes('no longer supported') ||
+    lower.includes('model_not_found') ||
+    lower.includes('does not exist') ||
+    lower.includes('invalid model')
+  );
+}
+
+async function callGroqModel(
+  apiKey: string,
+  model: string,
+  history: ChatTurn[]
+): Promise<string> {
   const response = await fetch(GROQ_CHAT_URL, {
     method: 'POST',
     headers: {
@@ -34,7 +51,7 @@ export async function getGroqChatReply(history: ChatTurn[]): Promise<string> {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model,
       messages: [
         { role: 'system', content: SUPPORT_SYSTEM_PROMPT },
         ...history.map((m) => ({ role: m.role, content: m.content })),
@@ -60,4 +77,29 @@ export async function getGroqChatReply(history: ChatTurn[]): Promise<string> {
   }
 
   return reply;
+}
+
+export async function getGroqChatReply(history: ChatTurn[]): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error('GROQ_API_KEY is not configured on the server');
+  }
+
+  const models = resolveModels();
+  let lastError: Error | null = null;
+
+  for (const model of models) {
+    try {
+      return await callGroqModel(apiKey, model, history);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      lastError = err instanceof Error ? err : new Error(message);
+      if (!isRetryableModelError(message)) {
+        throw lastError;
+      }
+      console.warn(`[chat] model ${model} unavailable, trying next…`);
+    }
+  }
+
+  throw lastError ?? new Error('Groq request failed');
 }
