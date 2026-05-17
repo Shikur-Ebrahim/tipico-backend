@@ -5,6 +5,7 @@ import {
   runLiveSync,
   runOddsSync,
   runRollingOddsFill,
+  runStoragePurge,
   ODDS_SYNC_BATCH,
 } from '../services/syncService';
 
@@ -46,6 +47,15 @@ router.post('/live', async (_req: Request, res: Response) => {
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Live sync failed' });
+  }
+});
+
+router.post('/purge', async (_req: Request, res: Response) => {
+  try {
+    const result = await runStoragePurge();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Storage purge failed' });
   }
 });
 

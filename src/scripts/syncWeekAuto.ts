@@ -8,9 +8,9 @@ import {
   fetchAndStoreFixtures,
   fetchAndStoreFixturesForRollingWindow,
   fetchAndStoreBulkOddsForRollingWindowByDate,
-  purgeStoredFixturesOutsideWindow,
   getFixtureWindowRange,
 } from '../services/apiFootball';
+import { runStoragePurge } from '../services/storagePurgeService';
 import { TOP_LEAGUES, runOddsSync, ODDS_SYNC_BATCH, getSyncStatus } from '../services/syncService';
 
 const DEFAULT_SEASON = parseInt(
@@ -135,7 +135,7 @@ async function main() {
   await syncOddsByDate();
   await syncTopLeagueFixtures();
   await fillOddsUntilTarget();
-  await purgeStoredFixturesOutsideWindow();
+  await runStoragePurge();
 
   const final = await windowCounts();
   const status = await getSyncStatus();

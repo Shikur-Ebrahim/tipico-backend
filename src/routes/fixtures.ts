@@ -427,6 +427,12 @@ router.get('/:id', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Fixture not found' });
       return;
     }
+
+    const noStore =
+      req.query.refresh === '1' ||
+      req.query.refresh === 'true' ||
+      req.query._ != null;
+    res.setHeader('Cache-Control', noStore ? 'no-store' : 'public, max-age=15');
     res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch fixture' });

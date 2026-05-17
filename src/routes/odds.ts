@@ -14,6 +14,7 @@ const ODDS_FROM = `FROM odds o
        JOIN bookmakers b ON o.bookmaker_id = b.id
        JOIN bet_markets bm ON o.market_id = bm.id`;
 
+/** Read odds from DB only — API-Football is updated by backend sync jobs, not on this route. */
 router.get('/bulk', async (req: Request, res: Response) => {
   try {
     const raw = String(req.query.ids || req.query.fixture_ids || '').trim();
@@ -30,6 +31,7 @@ router.get('/bulk', async (req: Request, res: Response) => {
       res.json({});
       return;
     }
+
     const { rows } = await pool.query(
       `${ODDS_SELECT}
        ${ODDS_FROM}
@@ -57,6 +59,12 @@ router.get('/bulk', async (req: Request, res: Response) => {
 
 router.get('/fixture/:fixtureId', async (req: Request, res: Response) => {
   try {
+    const fixtureId = parseInt(req.params.fixtureId as string, 10);
+    if (Number.isNaN(fixtureId)) {
+      res.status(400).json({ error: 'Invalid fixture id' });
+      return;
+    }
+
     const { rows } = await pool.query(
       `SELECT DISTINCT ON (bm.id, o.selection) 
         o.*, b.name as bookmaker_name, b.logo as bookmaker_logo,
@@ -65,7 +73,7 @@ router.get('/fixture/:fixtureId', async (req: Request, res: Response) => {
        WHERE o.fixture_id = $1
        ORDER BY bm.id, o.selection, o.last_update DESC NULLS LAST,
          CASE WHEN b.api_bookmaker_id = 8 THEN 0 ELSE 1 END, b.id`,
-      [req.params.fixtureId]
+      [fixtureId]
     );
     res.setHeader('Cache-Control', 'no-store');
     res.json(rows);

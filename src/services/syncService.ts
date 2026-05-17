@@ -7,13 +7,13 @@ import {
   fetchAndStoreBulkOdds,
   fetchAndStoreLiveMatches,
   getFootballApiUsage,
-  purgeStoredFixturesOutsideWindow,
   getFixtureWindowRange,
   fetchAndStoreFixturesForRollingWindow,
   fetchAndStoreBulkOddsForRollingWindowByDate,
   fetchAndStoreLeaguesByIds,
   fetchAndStoreFixtures,
 } from './apiFootball';
+import { purgeFinishedOddsAndLiveData, runStoragePurge } from './storagePurgeService';
 import { settlePendingBetSlips } from './betSettlementService';
 import pool, { verifyDatabaseConnection } from '../config/database';
 import { sqlFixtureHasDisplayableOdds } from '../utils/displayableOdds';
@@ -50,6 +50,7 @@ const ODDS_FETCH_CONCURRENCY = Math.min(
 
 let fullSyncRunning = false;
 let liveSyncRunning = false;
+let liveOddsSyncRunning = false;
 let oddsSyncRunning = false;
 let rollingFillRunning = false;
 
@@ -121,7 +122,7 @@ export async function runBootstrapSync() {
       }));
     }
 
-    await purgeStoredFixturesOutsideWindow();
+    await runStoragePurge();
 
     return { started: true, completed: true, leagues: leagues.length };
   } finally {
@@ -146,6 +147,43 @@ export async function runLiveSync() {
     return { started: true, completed: true };
   } finally {
     liveSyncRunning = false;
+  }
+}
+
+/**
+ * Sync odds for every active live match (API-Football → DB).
+ * Runs after live fixture sync so live_matches is current. Frontend only reads DB.
+ */
+export async function runLiveOddsSync() {
+  if (liveOddsSyncRunning) {
+    return { started: false, reason: 'Live odds sync already running' };
+  }
+
+  liveOddsSyncRunning = true;
+
+  try {
+    const { rows } = await pool.query<{ api_fixture_id: number }>(
+      `SELECT f.api_fixture_id
+       FROM live_matches lm
+       JOIN fixtures f ON f.id = lm.fixture_id
+       WHERE lm.is_active = true
+         AND f.api_fixture_id IS NOT NULL
+         AND f.status NOT IN ('FT', 'AET', 'PEN')`
+    );
+
+    const ids = rows.map((row) => row.api_fixture_id);
+    if (ids.length === 0) {
+      return { started: true, completed: true, fixtures: 0 };
+    }
+
+    for (let i = 0; i < ids.length; i += ODDS_FETCH_CONCURRENCY) {
+      const chunk = ids.slice(i, i + ODDS_FETCH_CONCURRENCY);
+      await Promise.all(chunk.map((apiFixtureId) => fetchAndStoreOdds(apiFixtureId)));
+    }
+
+    return { started: true, completed: true, fixtures: ids.length };
+  } finally {
+    liveOddsSyncRunning = false;
   }
 }
 
@@ -245,17 +283,23 @@ export async function runOddsSync(limit = ODDS_SYNC_BATCH) {
        ORDER BY 
          (CASE
            WHEN NOT (${displayableSql}) THEN 0
+           WHEN EXISTS (
+             SELECT 1 FROM live_matches lm
+             WHERE lm.fixture_id = f.id AND lm.is_active = true
+           )
+           AND (MAX(o.last_update) IS NULL OR MAX(o.last_update) < NOW() - INTERVAL '30 seconds')
+             THEN 1
            WHEN f.status IN ('1H', '2H', 'HT', 'LIVE', 'ET', 'P')
                 AND (MAX(o.last_update) IS NULL OR MAX(o.last_update) < NOW() - INTERVAL '30 seconds')
-             THEN 1
+             THEN 2
            WHEN f.status IN ('FT', 'AET', 'PEN')
                 AND f.match_date > NOW() - INTERVAL '3 hours'
                 AND (MAX(o.last_update) IS NULL OR MAX(o.last_update) < NOW() - INTERVAL '20 seconds')
-             THEN 2
-           WHEN f.status IN ('1H', '2H', 'HT', 'LIVE', 'ET', 'P') THEN 3
-           WHEN MAX(o.id) IS NULL THEN 4
-           WHEN f.status = 'NS' THEN 5
-           ELSE 6
+             THEN 3
+           WHEN f.status IN ('1H', '2H', 'HT', 'LIVE', 'ET', 'P') THEN 4
+           WHEN MAX(o.id) IS NULL THEN 5
+           WHEN f.status = 'NS' THEN 6
+           ELSE 7
          END) ASC,
          l.is_top DESC NULLS LAST,
          MAX(o.last_update) NULLS FIRST,
@@ -301,6 +345,7 @@ export async function getSyncStatus() {
     jobs: {
       fullSyncRunning,
       liveSyncRunning,
+      liveOddsSyncRunning,
       oddsSyncRunning,
     },
     counts: counts.rows[0],
@@ -401,7 +446,7 @@ export function startSyncJobs() {
     cron.schedule('12 */6 * * *', async () => {
       try {
         const r = await fetchAndStoreFixturesForRollingWindow();
-        await purgeStoredFixturesOutsideWindow();
+        await runStoragePurge();
         console.log(
           `[SYNC] Rolling fixture refresh done (API rows seen: ${r.fixturesSeen}, window days: ${r.days})`
         );
@@ -411,16 +456,17 @@ export function startSyncJobs() {
     });
   }
 
-  // Every 30s so scores / FT status reach the DB faster than a 1-minute tick
+  // Every 30s: live scores → DB, then live odds → DB (frontend never calls API-Football).
   cron.schedule('*/30 * * * * *', async () => {
     try {
       await runLiveSync();
+      await runLiveOddsSync();
     } catch (err) {
       console.error('[LIVE SYNC] Error:', err);
     }
   });
 
-  // Odds only via backend → DB; frontend reads DB. Run often so live / FT odds land quickly.
+  // General odds window fill (non-live backlog). Frontend reads DB only.
   cron.schedule('*/30 * * * * *', async () => {
     try {
       await runOddsSync(ODDS_SYNC_BATCH);
@@ -429,5 +475,25 @@ export function startSyncJobs() {
     }
   });
 
+  // Drop finished-match odds + old fixtures (storage). Every hour at :20.
+  cron.schedule('20 * * * *', async () => {
+    try {
+      await runStoragePurge();
+    } catch (err) {
+      console.error('[PURGE] Storage cleanup error:', err);
+    }
+  });
+
+  // Light pass: remove odds for FT games a few hours after kickoff (every 30 min).
+  cron.schedule('*/30 * * * *', async () => {
+    try {
+      await purgeFinishedOddsAndLiveData();
+    } catch (err) {
+      console.error('[PURGE] Finished odds cleanup error:', err);
+    }
+  });
+
   console.log('[SYNC] Cron jobs scheduled.');
 }
+
+export { runStoragePurge };

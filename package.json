@@ -12,6 +12,7 @@
     "sync:bootstrap": "ts-node-dev --transpile-only src/scripts/sync.ts bootstrap",
     "sync:live": "ts-node-dev --transpile-only src/scripts/sync.ts live",
     "sync:odds": "ts-node-dev --transpile-only src/scripts/sync.ts odds",
+    "sync:purge": "ts-node-dev --transpile-only src/scripts/sync.ts purge",
     "sync:fill-week": "ts-node-dev --transpile-only src/scripts/syncFillWeek.ts",
     "sync:top-week": "ts-node-dev --transpile-only src/scripts/syncTopWeek.ts",
     "sync:week-auto": "ts-node-dev --transpile-only src/scripts/syncWeekAuto.ts",

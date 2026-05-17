@@ -4,6 +4,7 @@ import {
   runBootstrapSync,
   runLiveSync,
   runOddsSync,
+  runStoragePurge,
 } from '../services/syncService';
 
 async function main() {
@@ -37,7 +38,13 @@ async function main() {
       return;
     }
 
-    throw new Error(`Unknown sync action: ${action}`);
+    if (action === 'purge') {
+      const result = await runStoragePurge();
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    throw new Error(`Unknown sync action: ${action} (use: status, bootstrap, live, odds, purge)`);
   } finally {
     await pool.end();
   }

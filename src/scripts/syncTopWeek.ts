@@ -8,9 +8,9 @@ import {
   fetchAndStoreLeagues,
   fetchAndStoreFixtures,
   fetchAndStoreBulkOdds,
-  purgeStoredFixturesOutsideWindow,
   getFixtureWindowRange,
 } from '../services/apiFootball';
+import { runStoragePurge } from '../services/storagePurgeService';
 import { TOP_LEAGUES } from '../services/syncService';
 
 const DEFAULT_SEASON = parseInt(
@@ -76,7 +76,7 @@ async function main() {
     console.log(`[sync:top-week] Window so far: ${c.n} fixtures, ${c.with_odds} with odds`);
   }
 
-  await purgeStoredFixturesOutsideWindow();
+  await runStoragePurge();
   const final = await countInWindow();
   console.log('[sync:top-week] Done. Fixtures in 7-day window:', final.n, '| with odds:', final.with_odds);
   await pool.end();

@@ -606,38 +606,6 @@ export async function fetchAndStoreBulkOddsForRollingWindowByDate() {
   return { days: FIXTURE_WINDOW_DAYS, oddsRowsSeen };
 }
 
-export async function purgeStoredFixturesOutsideWindow() {
-  const { start, endExclusive } = getFixtureWindowRange();
-  
-  const targetFixturesQuery = `
-    SELECT f.id
-    FROM fixtures f
-    WHERE (
-      -- Rule 1: Outside of the current Sunday-Saturday window
-      f.match_date < $1 OR f.match_date >= $2
-      -- Rule 2: Finished more than 24 hours ago
-      OR (f.status IN ('FT', 'AET', 'PEN') AND f.match_date < NOW() - INTERVAL '24 hours')
-    )
-    AND NOT EXISTS (
-      SELECT 1 FROM bet_selections bs WHERE bs.fixture_id = f.id
-    )
-  `;
-
-  const queryParams = [start, endExclusive];
-
-  await pool.query(
-    `DELETE FROM odds_history
-     WHERE odds_id IN (
-       SELECT o.id FROM odds o WHERE o.fixture_id IN (${targetFixturesQuery})
-     )`,
-    queryParams
-  );
-  await pool.query(`DELETE FROM live_odds WHERE fixture_id IN (${targetFixturesQuery})`, queryParams);
-  await pool.query(`DELETE FROM odds WHERE fixture_id IN (${targetFixturesQuery})`, queryParams);
-  await pool.query(`DELETE FROM live_events WHERE fixture_id IN (${targetFixturesQuery})`, queryParams);
-  await pool.query(`DELETE FROM fixtures WHERE id IN (${targetFixturesQuery})`, queryParams);
-}
-
 export async function fetchAndStoreBulkOdds(leagueApiId: number, season: number) {
   const items = await apiGetAllPages<BulkOddsApiItem>('/odds', { league: leagueApiId, season });
 
@@ -684,9 +652,13 @@ export async function fetchAndStoreOdds(fixtureApiId: number) {
       const bookmakerId = bookmakerRes.rows[0].id as number;
 
       for (const bet of bookmaker.bets || []) {
-        if (!bet.id) {
+        if (!bet.name && bet.id == null) {
           continue;
         }
+
+        const marketKey = String(bet.id ?? bet.name)
+          .toLowerCase()
+          .replace(/\s+/g, '_');
 
         const marketRes = await pool.query(
           `INSERT INTO bet_markets (name, market_key)
@@ -694,7 +666,7 @@ export async function fetchAndStoreOdds(fixtureApiId: number) {
            ON CONFLICT (market_key) DO UPDATE SET
              name = COALESCE(EXCLUDED.name, bet_markets.name)
            RETURNING id`,
-          [bet.name || null, String(bet.id)]
+          [bet.name || null, marketKey]
         );
         const marketId = marketRes.rows[0].id as number;
 
@@ -737,7 +709,8 @@ export async function fetchAndStoreOdds(fixtureApiId: number) {
 
 
 const fixtureRefreshAt = new Map<number, number>();
-const FIXTURE_REFRESH_MIN_MS = 10_000;
+/** Min gap between on-demand API pulls for the same fixture (match detail polls ~30s). */
+const FIXTURE_REFRESH_MIN_MS = 25_000;
 
 const FINISHED_STATUSES = new Set(['FT', 'AET', 'PEN']);
 
