@@ -14,15 +14,11 @@ import authRouter from './routes/auth';
 import adminRouter from './routes/admin';
 import userRouter from './routes/user';
 
-import { ensureManualPresetSchema } from './db/ensureManualPresetSchema';
+import { ensureBetSlipSchema } from './db/ensureBetSlipSchema';
 import { ensureWithdrawalMethodsTable } from './db/ensureWithdrawalRequests';
 import { ensureAppSettings } from './db/ensureAppSettings';
 
 dotenv.config();
-
-void ensureManualPresetSchema().catch((e) => console.error('[DB] ensureManualPresetSchema:', e));
-void ensureWithdrawalMethodsTable().catch((e) => console.error('[DB] ensureWithdrawalMethodsTable:', e));
-void ensureAppSettings().catch((e) => console.error('[DB] ensureAppSettings:', e));
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -72,7 +68,20 @@ app.use('/api/auth', authRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/user', userRouter);
 
-app.listen(PORT, () => {
-  console.log(`API listening on port ${PORT}`);
-  startSyncJobs();
-});
+async function startServer() {
+  try {
+    await ensureBetSlipSchema();
+    await ensureWithdrawalMethodsTable();
+    await ensureAppSettings();
+    console.log('[DB] schema ready');
+  } catch (e) {
+    console.error('[DB] startup schema ensure failed:', e);
+  }
+
+  app.listen(PORT, () => {
+    console.log(`API listening on port ${PORT}`);
+    startSyncJobs();
+  });
+}
+
+void startServer();

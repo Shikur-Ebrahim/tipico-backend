@@ -9,12 +9,14 @@ router.get('/matches', async (_req: Request, res: Response) => {
       `SELECT lm.*, f.match_date,
         ht.name as home_team_name, ht.logo as home_team_logo,
         at.name as away_team_name, at.logo as away_team_logo,
-        l.name as league_name
+        l.name as league_name, l.logo as league_logo, l.api_league_id,
+        c.name as country_name, c.flag_url
        FROM live_matches lm
        JOIN fixtures f ON lm.fixture_id = f.id
        JOIN teams ht ON f.home_team_id = ht.id
        JOIN teams at ON f.away_team_id = at.id
        JOIN leagues l ON f.league_id = l.id
+       LEFT JOIN countries c ON l.country_id = c.id
        WHERE lm.is_active = true
        ORDER BY f.match_date ASC`
     );

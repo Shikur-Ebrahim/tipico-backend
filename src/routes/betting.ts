@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import pool from '../config/database';
 import { isFixturePreMatchOnly } from '../utils/matchStatus';
 import { allocateUniqueTicketCode } from '../utils/ticketCode';
+import { ensureBetSlipSchema } from '../db/ensureBetSlipSchema';
 
 const router = Router();
 
@@ -400,37 +401,61 @@ router.post('/bet', async (req: Request, res: Response) => {
 
 // Get user bet history
 router.get('/history/:userId', async (req: Request, res: Response) => {
+  const tokenUserId = getUserIdFromBearer(req);
+  if (tokenUserId === null) {
+    res.status(401).json({ message: 'Login required' });
+    return;
+  }
+
+  const rawParam = req.params.userId;
+  const userIdParam = Array.isArray(rawParam) ? rawParam[0] : rawParam;
+  const requestedUserId = parseInt(String(userIdParam), 10);
+  if (!Number.isFinite(requestedUserId)) {
+    res.status(400).json({ message: 'Invalid user id' });
+    return;
+  }
+  if (tokenUserId !== requestedUserId) {
+    res.status(403).json({ message: 'Cannot view another user’s bet history' });
+    return;
+  }
+
   try {
+    await ensureBetSlipSchema();
     const { rows } = await pool.query(
       `SELECT bs.*,
-        COALESCE(json_agg(
-          json_build_object(
-            'fixture_id', bsel.fixture_id,
-            'selection', bsel.selection,
-            'odd', bsel.odd,
-            'result', bsel.result,
-            'home_team', bsel.home_team,
-            'away_team', bsel.away_team,
-            'home_logo', bsel.home_logo,
-            'away_logo', bsel.away_logo,
-            'league_name', bsel.league_name,
-            'market_name', bsel.market_name,
-            'kickoff_at', COALESCE(bsel.manual_kickoff_at, f.match_date)
-          )
-          ORDER BY bsel.id
-        ) FILTER (WHERE bsel.id IS NOT NULL), '[]') as selections
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'fixture_id', bsel.fixture_id,
+                'selection', bsel.selection,
+                'odd', bsel.odd,
+                'result', bsel.result,
+                'home_team', bsel.home_team,
+                'away_team', bsel.away_team,
+                'home_logo', bsel.home_logo,
+                'away_logo', bsel.away_logo,
+                'league_name', bsel.league_name,
+                'market_name', bsel.market_name,
+                'kickoff_at', COALESCE(bsel.manual_kickoff_at, f.match_date)
+              )
+              ORDER BY bsel.id
+            )
+            FROM bet_selections bsel
+            LEFT JOIN fixtures f ON f.id = bsel.fixture_id
+            WHERE bsel.bet_slip_id = bs.id
+          ),
+          '[]'::json
+        ) AS selections
        FROM bet_slips bs
-       LEFT JOIN bet_selections bsel ON bs.id = bsel.bet_slip_id
-       LEFT JOIN fixtures f ON f.id = bsel.fixture_id
        WHERE bs.user_id = $1
-       GROUP BY bs.id
        ORDER BY bs.created_at DESC`,
-      [req.params.userId]
+      [requestedUserId]
     );
     res.json(rows);
   } catch (err) {
     console.error('Bet history error:', err);
-    res.status(500).json({ error: 'Failed to fetch bet history' });
+    res.status(500).json({ message: 'Failed to fetch bet history' });
   }
 });
 
