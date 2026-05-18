@@ -5,6 +5,11 @@ import bcrypt from 'bcryptjs';
 import { ensureWithdrawalSchema } from '../db/ensureWithdrawalRequests';
 import { checkWithdrawalDepositEligibility } from '../services/depositRule';
 import { validatePromotionCodeForUser } from '../services/promotionCode';
+import {
+  checkDailyWithdrawalLimit,
+  getDailyWithdrawalLimitInfo,
+  MAX_DAILY_WITHDRAWAL_ETB,
+} from '../services/withdrawalDailyLimit';
 
 const router = Router();
 
@@ -183,8 +188,16 @@ router.get('/withdrawal-history', verifyUser, async (req: Request, res: Response
 router.get('/withdrawal-eligibility', verifyUser, async (req: Request, res: Response) => {
   const userId = req.body.userId;
   try {
-    const eligibility = await checkWithdrawalDepositEligibility(userId);
-    res.json(eligibility);
+    const [eligibility, daily] = await Promise.all([
+      checkWithdrawalDepositEligibility(userId),
+      getDailyWithdrawalLimitInfo(userId),
+    ]);
+    res.json({
+      ...eligibility,
+      maxDailyWithdrawal: MAX_DAILY_WITHDRAWAL_ETB,
+      withdrawnToday: daily.withdrawnToday,
+      remainingToday: daily.remainingToday,
+    });
   } catch (err) {
     console.error('withdrawal-eligibility error:', err);
     res.status(500).json({ message: 'Failed to check withdrawal eligibility' });
@@ -230,6 +243,17 @@ router.post('/withdrawal-request', verifyUser, async (req: Request, res: Respons
       return res.status(400).json({
         message: promoCheck.message || 'Invalid promotion code',
         code: 'PROMO_CODE_INVALID',
+      });
+    }
+
+    const dailyCheck = await checkDailyWithdrawalLimit(userId, amt);
+    if (!dailyCheck.allowed) {
+      return res.status(400).json({
+        message: dailyCheck.message,
+        code: 'DAILY_WITHDRAWAL_LIMIT',
+        maxDailyWithdrawal: MAX_DAILY_WITHDRAWAL_ETB,
+        withdrawnToday: dailyCheck.withdrawnToday,
+        remainingToday: dailyCheck.remainingToday,
       });
     }
 
