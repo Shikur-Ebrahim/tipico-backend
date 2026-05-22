@@ -17,6 +17,55 @@ import { purgeFinishedOddsAndLiveData, runStoragePurge } from './storagePurgeSer
 import { settlePendingBetSlips } from './betSettlementService';
 import pool, { verifyDatabaseConnection } from '../config/database';
 import { sqlFixtureHasDisplayableOdds } from '../utils/displayableOdds';
+import { isTransientDbError } from '../utils/dbRetry';
+
+// ─── DB Circuit Breaker ───────────────────────────────────────────────────────
+// When the database is unreachable, heavy background jobs will only make things
+// worse by queuing up more connections. The circuit breaker pauses all cron
+// work for CIRCUIT_BREAKER_COOLDOWN_MS after consecutive failures, then probes
+// again with a lightweight SELECT 1 before re-enabling.
+const CIRCUIT_BREAKER_THRESHOLD = 3;      // consecutive failures before opening
+const CIRCUIT_BREAKER_COOLDOWN_MS = 60_000; // 60 s cool-down before re-probe
+
+let _cbFailures = 0;
+let _cbOpenUntil = 0; // epoch ms — circuit stays open until this timestamp
+
+function circuitBreakerOpen(): boolean {
+  return Date.now() < _cbOpenUntil;
+}
+
+function recordDbSuccess(): void {
+  _cbFailures = 0;
+  _cbOpenUntil = 0;
+}
+
+function recordDbFailure(err: unknown): void {
+  if (!isTransientDbError(err)) return; // only connectivity errors trip the breaker
+  _cbFailures += 1;
+  if (_cbFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+    _cbOpenUntil = Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+    console.warn(
+      `[DB CIRCUIT BREAKER] Opened for ${CIRCUIT_BREAKER_COOLDOWN_MS / 1000}s ` +
+        `after ${_cbFailures} consecutive transient errors.`
+    );
+  }
+}
+
+/** Run `fn` only if the circuit breaker is closed (DB is healthy). */
+async function withCircuitBreaker<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
+  if (circuitBreakerOpen()) {
+    console.log(`[${label}] Skipped — DB circuit breaker is open, waiting for recovery.`);
+    return undefined;
+  }
+  try {
+    const result = await fn();
+    recordDbSuccess();
+    return result;
+  } catch (err) {
+    recordDbFailure(err);
+    throw err;
+  }
+}
 
 export const TOP_LEAGUES = [
   39,  // English Premier League
@@ -314,11 +363,10 @@ export async function runOddsSync(limit = ODDS_SYNC_BATCH) {
       await Promise.all(chunk.map((apiFixtureId) => fetchAndStoreOdds(apiFixtureId)));
     }
 
-    try {
-      await settlePendingBetSlips();
-    } catch (err) {
-      console.error('[BET SETTLEMENT] Error after odds sync:', err);
-    }
+    // NOTE: settlePendingBetSlips is intentionally NOT called here.
+    // It is already called inside runLiveSync (every 30 s) to avoid
+    // running the settlement twice per 30-second window and doubling
+    // the DB connection pressure from the per-slip transactions.
 
     return { started: true, completed: true, fixtures: fixtures.rowCount };
   } finally {
@@ -353,13 +401,7 @@ export async function getSyncStatus() {
 }
 
 function isDatabaseConnectivityError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return (
-    msg.includes('connection timeout') ||
-    msg.includes('ECONNREFUSED') ||
-    msg.includes('Connection terminated') ||
-    msg.includes('getaddrinfo')
-  );
+  return isTransientDbError(err);
 }
 
 function shouldRunBootstrapOnStart(): boolean {
@@ -418,79 +460,103 @@ export function startSyncJobs() {
     }
   })();
 
+  // ── Nightly full bootstrap: countries, leagues, fixtures, bulk odds (03:00 UTC) ──
   cron.schedule('0 3 * * *', async () => {
-    try {
-      await runBootstrapSync();
-      await runRollingOddsFill();
-    } catch (err) {
-      console.error('[SYNC] Error:', err);
-    }
+    await withCircuitBreaker('SYNC/bootstrap', async () => {
+      try {
+        await runBootstrapSync();
+        await runRollingOddsFill();
+      } catch (err) {
+        console.error('[SYNC] Error:', err);
+        throw err;
+      }
+    });
   });
 
-  // Top up odds for fixtures missing displayable 1X2 in the 7-day window (toward 5000 cap).
+  // ── Top-up odds (toward 5 000 fixture target) every 4 hours ──────────────
   cron.schedule('0 */4 * * *', async () => {
-    try {
-      await runRollingOddsFill();
-    } catch (err) {
-      console.error('[SYNC] Rolling odds fill error:', err);
-    }
+    await withCircuitBreaker('SYNC/rolling-fill', async () => {
+      try {
+        await runRollingOddsFill();
+      } catch (err) {
+        console.error('[SYNC] Rolling odds fill error:', err);
+        throw err;
+      }
+    });
   });
 
-  // Re-pull fixtures by date into the DB between full bootstraps (frontend reads DB only).
-  // Set ROLLING_FIXTURE_REFRESH=0 to disable. Default: every 6 hours at :12.
+  // ── Re-pull fixtures by date every 6 hours at :12 ────────────────────────
   const rollingRefreshOff =
     process.env.ROLLING_FIXTURE_REFRESH === '0' ||
     process.env.ROLLING_FIXTURE_REFRESH === 'false' ||
     process.env.ROLLING_FIXTURE_REFRESH === 'no';
   if (!rollingRefreshOff) {
     cron.schedule('12 */6 * * *', async () => {
-      try {
-        const r = await fetchAndStoreFixturesForRollingWindow();
-        await runStoragePurge();
-        console.log(
-          `[SYNC] Rolling fixture refresh done (API rows seen: ${r.fixturesSeen}, window days: ${r.days})`
-        );
-      } catch (err) {
-        console.error('[SYNC] Rolling fixture refresh error:', err);
-      }
+      await withCircuitBreaker('SYNC/rolling-fixture', async () => {
+        try {
+          const r = await fetchAndStoreFixturesForRollingWindow();
+          await runStoragePurge();
+          console.log(
+            `[SYNC] Rolling fixture refresh done (API rows seen: ${r.fixturesSeen}, window days: ${r.days})`
+          );
+        } catch (err) {
+          console.error('[SYNC] Rolling fixture refresh error:', err);
+          throw err;
+        }
+      });
     });
   }
 
-  // Every 30s: live scores → DB, then live odds → DB (frontend never calls API-Football).
+  // ── Live scores + bet settlement every 30 s (fires at second :00 and :30) ─
+  // Separated from odds-sync so they don't compete for the same pool slots.
   cron.schedule('*/30 * * * * *', async () => {
-    try {
-      await runLiveSync();
-      await runLiveOddsSync();
-    } catch (err) {
-      console.error('[LIVE SYNC] Error:', err);
-    }
+    await withCircuitBreaker('LIVE SYNC', async () => {
+      try {
+        await runLiveSync();      // fetches live scores + settles bets
+        await runLiveOddsSync(); // fetches live odds only
+      } catch (err) {
+        console.error('[LIVE SYNC] Error:', err);
+        throw err;
+      }
+    });
   });
 
-  // General odds window fill (non-live backlog). Frontend reads DB only.
-  cron.schedule('*/30 * * * * *', async () => {
-    try {
-      await runOddsSync(ODDS_SYNC_BATCH);
-    } catch (err) {
-      console.error('[ODDS SYNC] Error:', err);
-    }
+  // ── General odds backlog fill — STAGGERED to second :15 and :45 ───────────
+  // By offsetting 15 s from the live-sync cron we halve the peak connection
+  // demand and avoid both jobs racing for the same pool slots simultaneously.
+  cron.schedule('15-59/30 * * * * *', async () => {
+    await withCircuitBreaker('ODDS SYNC', async () => {
+      try {
+        await runOddsSync(ODDS_SYNC_BATCH);
+      } catch (err) {
+        console.error('[ODDS SYNC] Error:', err);
+        throw err;
+      }
+    });
   });
 
-  // Drop finished-match odds + old fixtures (storage). Every hour at :20.
+  // ── Storage purge: old odds + finished fixtures every hour at :20 ─────────
   cron.schedule('20 * * * *', async () => {
-    try {
-      await runStoragePurge();
-    } catch (err) {
-      console.error('[PURGE] Storage cleanup error:', err);
-    }
+    await withCircuitBreaker('PURGE/storage', async () => {
+      try {
+        await runStoragePurge();
+      } catch (err) {
+        console.error('[PURGE] Storage cleanup error:', err);
+        throw err;
+      }
+    });
   });
 
-  // Light pass: remove odds for FT games a few hours after kickoff (every 30 min).
-  cron.schedule('*/30 * * * *', async () => {
-    try {
-      await purgeFinishedOddsAndLiveData();
-    } catch (err) {
-      console.error('[PURGE] Finished odds cleanup error:', err);
-    }
+  // ── Light purge: FT odds every 30 min at :05 and :35 (offset from others) ─
+  cron.schedule('5-59/30 * * * *', async () => {
+    await withCircuitBreaker('PURGE/finished-odds', async () => {
+      try {
+        await purgeFinishedOddsAndLiveData();
+      } catch (err) {
+        console.error('[PURGE] Finished odds cleanup error:', err);
+        throw err;
+      }
+    });
   });
 
   console.log('[SYNC] Cron jobs scheduled.');

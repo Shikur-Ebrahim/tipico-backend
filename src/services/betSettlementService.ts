@@ -1,5 +1,6 @@
 import pool from '../config/database';
 import { isFixtureFinishedForSettlement } from '../utils/matchStatus';
+import { withDbRetry } from '../utils/dbRetry';
 
 let settlementRunning = false;
 
@@ -124,85 +125,108 @@ export async function settlePendingBetSlips(): Promise<{
     );
     legsUpdated += manualUpd.rowCount ?? 0;
 
-    const { rows: pendingSlips } = await pool.query<{ id: number }>(
-      `SELECT id FROM bet_slips WHERE status = 'pending' ORDER BY id`
+    const { rows: pendingSlips } = await withDbRetry(() =>
+      pool.query<{ id: number }>(
+        `SELECT id FROM bet_slips WHERE status = 'pending' ORDER BY id`
+      )
     );
 
-    for (const { id: slipId } of pendingSlips) {
-      slipsReconciled += 1;
-      const stat = await pool.query<{
-        total: string;
-        lost: string;
-        won: string;
-        unsettled: string;
-      }>(
-        `SELECT
-           COUNT(*)::text AS total,
-           COUNT(*) FILTER (WHERE TRIM(COALESCE(result, '')) = 'lost')::text AS lost,
-           COUNT(*) FILTER (WHERE TRIM(COALESCE(result, '')) = 'won')::text AS won,
-           COUNT(*) FILTER (WHERE result IS NULL OR TRIM(result) = '')::text AS unsettled
-         FROM bet_selections WHERE bet_slip_id = $1`,
-        [slipId]
-      );
+    // ── Single shared client for all slip transactions ────────────────────
+    // Acquiring pool.connect() once here (instead of once per slip) keeps
+    // peak connection usage at O(1) regardless of how many slips are pending,
+    // which prevents the pool from exhausting under load.
+    const client = await pool.connect();
+    try {
+      for (const { id: slipId } of pendingSlips) {
+        slipsReconciled += 1;
 
-      const total = parseInt(stat.rows[0]?.total || '0', 10);
-      const lost = parseInt(stat.rows[0]?.lost || '0', 10);
-      const won = parseInt(stat.rows[0]?.won || '0', 10);
-      const unsettled = parseInt(stat.rows[0]?.unsettled || '0', 10);
-
-      if (total === 0) continue;
-
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        const slipRes = await client.query<{
-          id: number;
-          user_id: number | null;
-          possible_win: string;
-          status: string;
-          is_manual_preset: boolean | null;
+        const stat = await client.query<{
+          total: string;
+          lost: string;
+          won: string;
+          unsettled: string;
         }>(
-          `SELECT id, user_id, possible_win::text, status, COALESCE(is_manual_preset, false) AS is_manual_preset
-           FROM bet_slips WHERE id = $1 FOR UPDATE`,
+          `SELECT
+             COUNT(*)::text AS total,
+             COUNT(*) FILTER (WHERE TRIM(COALESCE(result, '')) = 'lost')::text AS lost,
+             COUNT(*) FILTER (WHERE TRIM(COALESCE(result, '')) = 'won')::text AS won,
+             COUNT(*) FILTER (WHERE result IS NULL OR TRIM(result) = '')::text AS unsettled
+           FROM bet_selections WHERE bet_slip_id = $1`,
           [slipId]
         );
 
-        const slip = slipRes.rows[0];
-        if (!slip || slip.status !== 'pending') {
-          await client.query('COMMIT');
-          continue;
-        }
+        const total = parseInt(stat.rows[0]?.total || '0', 10);
+        const lost = parseInt(stat.rows[0]?.lost || '0', 10);
+        const won = parseInt(stat.rows[0]?.won || '0', 10);
+        const unsettled = parseInt(stat.rows[0]?.unsettled || '0', 10);
 
-        if (lost > 0) {
-          await client.query(`UPDATE bet_slips SET status = 'lost' WHERE id = $1 AND status = 'pending'`, [slipId]);
-          await client.query('COMMIT');
-          continue;
-        }
+        if (total === 0) continue;
 
-        if (unsettled === 0 && won === total) {
-          const paid = await client.query(`SELECT 1 FROM bet_results WHERE bet_slip_id = $1 LIMIT 1`, [slipId]);
-          const isPreset = slip.is_manual_preset === true;
-          if (paid.rows.length === 0 && !isPreset && slip.user_id != null) {
-            const amount = parseFloat(slip.possible_win || '0');
-            if (Number.isFinite(amount) && amount > 0) {
-              await client.query(`UPDATE wallets SET balance = balance + $1 WHERE user_id = $2`, [amount, slip.user_id]);
-              await client.query(
-                `INSERT INTO bet_results (bet_slip_id, status, win_amount, settled_at)
-                 VALUES ($1, 'won', $2, NOW())`,
-                [slipId, amount]
-              );
-            }
+        try {
+          await client.query('BEGIN');
+
+          const slipRes = await client.query<{
+            id: number;
+            user_id: number | null;
+            possible_win: string;
+            status: string;
+            is_manual_preset: boolean | null;
+          }>(
+            `SELECT id, user_id, possible_win::text, status,
+                    COALESCE(is_manual_preset, false) AS is_manual_preset
+             FROM bet_slips WHERE id = $1 FOR UPDATE`,
+            [slipId]
+          );
+
+          const slip = slipRes.rows[0];
+          if (!slip || slip.status !== 'pending') {
+            await client.query('COMMIT');
+            continue;
           }
-          await client.query(`UPDATE bet_slips SET status = 'won' WHERE id = $1 AND status = 'pending'`, [slipId]);
-        }
 
-        await client.query('COMMIT');
-      } catch (e) {
-        await client.query('ROLLBACK');
-        console.error('[BET SETTLEMENT] slip reconcile error:', slipId, e);
-      } finally {
-        client.release();
+          if (lost > 0) {
+            await client.query(
+              `UPDATE bet_slips SET status = 'lost' WHERE id = $1 AND status = 'pending'`,
+              [slipId]
+            );
+            await client.query('COMMIT');
+            continue;
+          }
+
+          if (unsettled === 0 && won === total) {
+            const paid = await client.query(
+              `SELECT 1 FROM bet_results WHERE bet_slip_id = $1 LIMIT 1`,
+              [slipId]
+            );
+            const isPreset = slip.is_manual_preset === true;
+            if (paid.rows.length === 0 && !isPreset && slip.user_id != null) {
+              const amount = parseFloat(slip.possible_win || '0');
+              if (Number.isFinite(amount) && amount > 0) {
+                await client.query(
+                  `UPDATE wallets SET balance = balance + $1 WHERE user_id = $2`,
+                  [amount, slip.user_id]
+                );
+                await client.query(
+                  `INSERT INTO bet_results (bet_slip_id, status, win_amount, settled_at)
+                   VALUES ($1, 'won', $2, NOW())`,
+                  [slipId, amount]
+                );
+              }
+            }
+            await client.query(
+              `UPDATE bet_slips SET status = 'won' WHERE id = $1 AND status = 'pending'`,
+              [slipId]
+            );
+          }
+
+          await client.query('COMMIT');
+        } catch (e) {
+          try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+          console.error('[BET SETTLEMENT] slip reconcile error:', slipId, e);
+        }
       }
+    } finally {
+      client.release();
     }
 
     return { legsUpdated, slipsReconciled };
